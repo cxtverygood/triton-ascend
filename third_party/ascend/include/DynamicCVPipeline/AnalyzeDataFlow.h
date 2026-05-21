@@ -90,7 +90,23 @@ public:
   }
 };
 
+// Pass for analyzing MemRef-type dependencies in main_loop
+class AnalyzeDepsPass : public PassWrapper<AnalyzeDepsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeDepsPass)
+
+  AnalyzeDepsPass() = default;
+
+  void runOnOperation() override;
+
+  llvm::StringRef getArgument() const override { return "analyze-deps"; }
+  llvm::StringRef getDescription() const override {
+    return "Analyze dependencies and detect MemRefType usage in main_loop";
+  }
+};
+
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeArgsPass();
+std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDepsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeFlagPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDataFlowPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeScopePass();
