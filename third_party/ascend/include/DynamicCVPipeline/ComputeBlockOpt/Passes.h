@@ -32,7 +32,6 @@ namespace triton {
 std::unique_ptr<OperationPass<ModuleOp>> createUBUsageOptPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUnifyAllocBlockPass();
 void registerUnifyAllocBlockPass();
-std::unique_ptr<OperationPass<ModuleOp>> createFuseAdotBaddCPass();
 std::unique_ptr<OperationPass<ModuleOp>> createFixpipeOptPass();
 
 } // namespace triton
