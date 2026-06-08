@@ -21,6 +21,8 @@
  * THE SOFTWARE.
  */
 
+#include <cstdlib>
+
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/TritonToLinalg/ArgMinMaxConverter.h"
@@ -33,7 +35,11 @@
 #include "ascend/include/TritonToLinalg/HoistBroadcast.h"
 #include "ascend/include/TritonToLinalg/UseAnalysis.h"
 #include "ascend/include/TritonToLinalg/ImplicitPermute.h"
+#include "ascend/include/TritonToLinalg/StridedLoadStoreRewrite.h"
+#include "ascend/include/TritonToLinalg/StridedAxisCoalescing.h"
+#include "ascend/include/TritonToLinalg/TileChunkCoalescing.h"
 #include "ascend/include/TritonToLinalg/MarkTensorKindPass.h"
+#include "ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
 #include "ascend/include/TritonToStructured/CannonicalizerConverter.h"
 #include "ascend/include/Utils/InterleaveOptimization.h"
 #include "ascend/include/Utils/Utils.h"
@@ -63,6 +69,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -119,6 +126,85 @@ static bool isSIMTOp(Operation *op)
       triton::ascend::IndirectLoadOp,
       triton::ascend::IndirectStoreOp
       >(op);
+}
+
+static bool isZeroSplat(DenseElementsAttr attr) {
+  if (!attr.isSplat())
+    return false;
+
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr.getSplatValue<Attribute>()))
+    return intAttr.getValue().isZero();
+
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr.getSplatValue<Attribute>()))
+    return floatAttr.getValue().isZero();
+
+  return false;
+}
+
+static FailureOr<DenseElementsAttr> getZeroTensorReturn(triton::FuncOp func) {
+  if (!func.isPrivate() || func.getNumArguments() != 0 ||
+      func.getFunctionType().getNumResults() != 1 ||
+      !isa<RankedTensorType>(func.getFunctionType().getResult(0)) ||
+      !func.getBody().hasOneBlock())
+    return failure();
+
+  Block &body = func.getBody().front();
+  auto returnOp = dyn_cast<triton::ReturnOp>(body.getTerminator());
+  if (!returnOp || returnOp->getNumOperands() != 1)
+    return failure();
+
+  Value returnValue = returnOp->getOperand(0);
+  auto constOp = returnValue.getDefiningOp<arith::ConstantOp>();
+  if (!constOp)
+    return failure();
+
+  auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValue());
+  if (!denseAttr || !isZeroSplat(denseAttr))
+    return failure();
+
+  return denseAttr;
+}
+
+static LogicalResult inlineZeroTensorHelpers(ModuleOp moduleOp) {
+  DenseMap<StringAttr, DenseElementsAttr> zeroHelpers;
+  SmallVector<triton::FuncOp> eraseFuncs;
+  for (triton::FuncOp func : moduleOp.getOps<triton::FuncOp>()) {
+    FailureOr<DenseElementsAttr> zeroAttr = getZeroTensorReturn(func);
+    if (failed(zeroAttr))
+      continue;
+
+    zeroHelpers[func.getSymNameAttr()] = *zeroAttr;
+    eraseFuncs.push_back(func);
+  }
+
+  if (zeroHelpers.empty())
+    return success();
+
+  SmallVector<triton::CallOp> eraseCalls;
+  moduleOp.walk([&](triton::CallOp callOp) {
+    auto it = zeroHelpers.find(callOp.getCalleeAttr().getRootReference());
+    if (it == zeroHelpers.end())
+      return;
+
+    if (callOp->getNumOperands() != 0 || callOp->getNumResults() != 1)
+      return;
+
+    OpBuilder builder(callOp);
+    Value replacement =
+        builder.create<arith::ConstantOp>(callOp.getLoc(), it->second);
+    callOp.getResult(0).replaceAllUsesWith(replacement);
+    eraseCalls.push_back(callOp);
+  });
+
+  for (triton::CallOp callOp : eraseCalls)
+    callOp.erase();
+
+  for (triton::FuncOp func : eraseFuncs) {
+    if (SymbolTable::symbolKnownUseEmpty(func, moduleOp))
+      func.erase();
+  }
+
+  return success();
 }
 
 TritonTypeConverter::TritonTypeConverter() {
@@ -744,6 +830,62 @@ LogicalResult TritonToLinalgPass::processImplicitPermuteOperations(ModuleOp modu
   return runPipeline(pm, getOperation());
 }
 
+LogicalResult TritonToLinalgPass::processStridedLoadStoreRewriteOperations(ModuleOp moduleOp)
+{
+  // The strided-axis rewrites below only apply in 950 SIMT mode. On other
+  // targets we leave strided loads to the legacy strided DMA lowering.
+  if (!(compileOn91095Flag && forceSimtTemplateFlag)) {
+    return success();
+  }
+
+  // Both passes below coalesce by recording a single module-level
+  // (hacc.coalesce_factor, hacc.coalesce_axis) pair. The full-TA path owns the
+  // grid division: compiler.py strips both attrs into host metadata and the
+  // launcher (driver.py) divides grid[axis] by the factor before launch --
+  // bishengir does NOT interpret them. At most one pass may claim the factor per
+  // module. StridedAxisCoalescing has PRIORITY: it runs first and
+  // unconditionally, and TileChunkCoalescing yields (bails) if the factor is
+  // already set.
+
+  // StridedAxisCoalescing (default-on, higher priority): fold the FLA
+  // H-axis-split strided load/store into a 2D contiguous [BT,H] tile (H as a
+  // parallel inner lane), turning the per-element strided access into a
+  // contiguous one. Bails per kernel when the load->store subgraph is not
+  // lane-safe (e.g. contains tt.dot), leaving those loads to the stride dispatch
+  // below.
+  StridedAxisCoalescing::rewriteStridedAxisCoalesce(moduleOp);
+
+  // TileChunkCoalescing (default-on, lower priority): when the outermost
+  // program-id axis is a pure tile index over a contiguous problem axis with a
+  // small tile T, fold H adjacent tiles into one program so the per-tile
+  // load/store become a single contiguous H*T DMA (H picked so the block is
+  // >= 512B and within UB). Emits hacc.coalesce_factor = H and
+  // hacc.coalesce_axis. Bails when the pattern / lane-safety do not hold, when
+  // the kernel reads num_programs(axis) (the launcher changes it), or when
+  // StridedAxisCoalescing above already claimed the coalesce factor.
+  TileChunkCoalescing::rewriteTileChunkCoalesce(moduleOp);
+
+  mlir::RewritePatternSet patterns(&getContext());
+  patterns.add<StridedLoadStoreRewrite::LoadConverter,
+               StridedLoadStoreRewrite::StoreConverter>(patterns.getContext());
+
+  if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
+    LLVM_DEBUG({
+      llvm::dbgs() << "StridedLoadStoreRewrite: pattern application failed\n";
+    });
+    return failure();
+  }
+
+  // Mirror processImplicitPermuteOperations: clean up dead IR left behind by
+  // PtrAnalysis when the pattern decided not to rewrite (e.g. stride==1 case
+  // returns failure() but PtrAnalysis has already inserted helper ExtSI ops).
+  // Without this, downstream passes may trip on stale uses.
+  mlir::PassManager pm(&getContext(), moduleOp.getOperationName());
+  pm.addPass(createCSEPass());
+  pm.addPass(createCanonicalizerPass());
+  return runPipeline(pm, getOperation());
+}
+
 LogicalResult TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp)
 {
   mlir::ConversionTarget target(getContext());
@@ -784,20 +926,14 @@ void TritonToLinalgPass::runOnOperation() {
     });
   existDotFlag = existDot;
 
+  // NOTE: existSIMTOp is intentionally computed AFTER
+  // processStridedLoadStoreRewriteOperations below, because that step materializes
+  // triton::ascend::IndirectLoadOp/IndirectStoreOp (which isSIMTOp() counts).
+  // Walking here (before the rewrite) would miss them and mislabel the kernel
+  // parallel_mode as "simd" instead of "mix_simd_simt"; then enable_simt would
+  // be false and the launch would not reserve localMemorySize for the SIMT
+  // templates -> VEC UB out-of-bounds (error 341) at runtime on mix-CV kernels.
   bool existSIMTOp = false;
-  moduleOp.walk([&](Operation *op) {
-    if (isSIMTOp(op)) {
-      existSIMTOp = true;
-      LLVM_DEBUG({
-        auto &os = llvm::dbgs();
-        os << "Found SIMT op in function: ";
-        os << op->getName();
-        os << "\n";
-      });
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
 
   // Execute tensor descriptor operations conversion
   if (failed(processDescriptorOperations(moduleOp))) {
@@ -811,6 +947,33 @@ void TritonToLinalgPass::runOnOperation() {
     });
     signalPassFailure();
   }
+
+  // SIMT IndirectLoad fast-path rewrite (runs after ImplicitPermute so the
+  // permuted access patterns have already been absorbed; this step only
+  // catches non-permuted last-axis stride > 1 loads).
+  if (failed(processStridedLoadStoreRewriteOperations(moduleOp))) {
+    LLVM_DEBUG({
+      llvm::dbgs() << "Failed to process indirect-load rewrite operations\n";
+    });
+    signalPassFailure();
+  }
+
+  // Detect SIMT ops AFTER the indirect-load rewrite so the freshly materialized
+  // IndirectLoadOp/IndirectStoreOp are counted (drives parallel_mode ->
+  // "mix_simd_simt" -> enable_simt -> launch reserves localMemorySize).
+  moduleOp.walk([&](Operation *op) {
+    if (isSIMTOp(op)) {
+      existSIMTOp = true;
+      LLVM_DEBUG({
+        auto &os = llvm::dbgs();
+        os << "Found SIMT op in function: ";
+        os << op->getName();
+        os << "\n";
+      });
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
 
   // 0. Annotate Memory-Related Triton FuncOps with tensor_kind (used by profiling).
   {
@@ -844,6 +1007,12 @@ void TritonToLinalgPass::runOnOperation() {
       signalPassFailure();
       return;
     }
+  }
+
+  if (failed(inlineZeroTensorHelpers(moduleOp))) {
+    moduleOp->emitError("failed to inline zero tensor helper functions");
+    signalPassFailure();
+    return;
   }
 
   // 2. Perform use analysis on FuncOp.

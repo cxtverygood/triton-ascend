@@ -1,4 +1,4 @@
-﻿# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -88,6 +88,20 @@ def _get_then_remove_rc(mod, attr_name: str) -> int:
         return -1
 
     return attr_value
+
+
+def _export_coalesce_metadata(mod, metadata):
+    # Tile/strided coalescing (TritonToLinalg) records the chosen coalesce factor
+    # H and the grid axis it applies to as module attrs hacc.coalesce_factor /
+    # hacc.coalesce_axis. In the full-TA design the *launcher* (driver.py) owns
+    # the grid division: it divides grid[axis] by H before launch, and bishengir
+    # no longer interprets the attrs. Read them into metadata here and strip them
+    # from the module so the hacc.* attrs never reach hivmc (which rejects
+    # unknown module attrs). Absent attrs -> factor 1 (no-op) / axis -1.
+    factor = _get_then_remove_rc(mod, "hacc.coalesce_factor")
+    axis = _get_then_remove_rc(mod, "hacc.coalesce_axis")
+    metadata["coalesce_factor"] = factor if isinstance(factor, int) and factor > 1 else 1
+    metadata["coalesce_axis"] = axis if isinstance(axis, int) and axis >= 0 else -1
 
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
@@ -234,6 +248,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                                           enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
+        _export_coalesce_metadata(mod, metadata)
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -267,6 +282,10 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
 
     DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX = r'hivm.disable_auto_tile_and_bind_subblock'
 
+    # Inserted by DiscreteMaskAccessConversionPass / MemOpConverter when discrete
+    # masked stores need cross-block exclusion (e.g. hivm.sync_block_lock).
+    SYNC_BLOCK_LOCK_REGEX = r'\bsync_block_lock\b'
+
     # Example: mix_mode = "aiv" -> aiv
     MIX_MODE_REGEX = r'mix_mode\s*=\s*"([^"]+)"'
 
@@ -287,6 +306,11 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     metadata["shared"] = 1
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
+    # Turn off auto-blockify when sync_block_lock/unlock was inserted: the lock
+    # protects a cross-block read-modify-write and is incompatible with packing
+    # logical blocks into a sequential auto-blockify loop.
+    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg):
+        metadata["has_auto_blockify_blacklist_op"] = True
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
@@ -509,9 +533,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 [f"--set-workspace-multibuffer={set_workspace_multibuffer}"]
 
         auto_multi_buffer = metadata["limit_auto_multi_buffer_of_local_buffer"]
-        if auto_multi_buffer is not None:
-            _compile_option_list += \
-                [f"--limit-auto-multi-buffer-of-local-buffer={auto_multi_buffer}"]
+        if auto_multi_buffer is None:
+            auto_multi_buffer = "no-limit"
+        _compile_option_list += \
+            [f"--limit-auto-multi-buffer-of-local-buffer={auto_multi_buffer}"]
         auto_multi_buffer_buffer = metadata["limit_auto_multi_buffer_buffer"]
         if auto_multi_buffer_buffer is not None:
             _compile_option_list += \
@@ -889,7 +914,7 @@ class NPUOptions:
     cluster_dims: tuple = (1, 1, 1)
     num_warps: int = 32
     num_ctas: int = 1
-    num_stages: int = 1 if is_compile_on_910_95 else 2
+    num_stages: int = 2
     warp_size: int = 32
     num_buffers_warp_spec: int = 0
     num_consumer_groups: int = 0
@@ -917,7 +942,7 @@ class NPUOptions:
     extern_libs: dict = None
     bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
 
-    multibuffer: bool = not is_compile_on_910_95
+    multibuffer: bool = True
     storage_align: bool = None
     ops_reorder: bool = None
     code_motion: bool = None
