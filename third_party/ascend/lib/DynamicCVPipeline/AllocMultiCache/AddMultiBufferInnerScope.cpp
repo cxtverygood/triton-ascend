@@ -109,6 +109,32 @@ static int getSsbufferId(Operation *op)
     return INT_MIN;
 }
 
+// Get the "effective" block_id for an op, walking up the parent chain to find
+// the enclosing ifOp's block_id. This is used when judging cross-block deps:
+// the "logical user" of a depVal inside an ifOp is the ifOp itself, not the
+// inner op that directly uses the value.
+//
+// Walks up parent chain but stops at the main_loop boundary (scf.for with
+// ssbuffer.main_loop attribute), so ops outside the main_loop are not affected.
+static int getOutermostSsbufferId(Operation *op)
+{
+    int result = INT_MIN;
+    Operation *current = op;
+    while (current) {
+        // Stop walking up at the main_loop boundary
+        if (auto forOp = dyn_cast<scf::ForOp>(current)) {
+            if (forOp->hasAttr(kMainLoop))
+                break;
+        }
+        int curId = getSsbufferId(current);
+        if (curId != INT_MIN) {
+            result = curId;
+        }
+        current = current->getParentOp();
+    }
+    return result;
+}
+
 void collectNestedOps(Block *block, SmallVector<Operation *> &ops)
 {
     for (auto &op : *block) {
@@ -246,11 +272,18 @@ static int groupOpsBySsbufferId(SmallVector<Operation *> &allOps,
         for (auto res : op->getResults())
             opsByValue[res] = op;
     }
+    // Deduplicate by op (multi-result ops like scf.if with N results were
+    // inserted N times into opsByValue and would be pushed N times into opsById,
+    // producing duplicated dep_marks like [1, 1] instead of [1]).
+    DenseSet<Operation *> seen;
     for (auto &p : opsByValue) {
-        int id = getSsbufferId(p.second);
+        Operation *op = p.second;
+        if (!seen.insert(op).second)
+            continue;
+        int id = getSsbufferId(op);
         if (id == INT_MIN)
             continue;
-        opsById[id].push_back(p.second);
+        opsById[id].push_back(op);
     }
     return 0;
 }
@@ -281,6 +314,11 @@ static int collectInnerBlockInfo(scf::ForOp forOp, DenseMap<Value, InnerBlockInf
                 outputToBlockId[res] = p.first;
 
     // Collect dependency values for each block
+    // Include inner ops of multi-region ops (e.g. scf.if) so their scalar
+    // deps get tracked. The cross-block judgment still uses the ifOp's
+    // block_id via getOutermostSsbufferId, so the dep is correctly attributed
+    // to the ifOp for buffer allocation while dep_mark can still be applied
+    // to the actual inner op users.
     for (auto &p : opsById) {
         Value groupKey = p.second.front()->getResult(0);
         InnerBlockInfo bi;
@@ -291,6 +329,34 @@ static int collectInnerBlockInfo(scf::ForOp forOp, DenseMap<Value, InnerBlockInf
         for (Operation *op : bi.ops)
             for (Value operand : op->getOperands())
                 collectDepValue(operand, body, p.first, outputToBlockId, depValueMap, groupKey);
+    }
+
+    // Additional pass: collect dep values from yield ops of multi-region consumers
+    // (e.g. scf.if, scf.while) that are direct children of main_loop forOp.
+    // Treat the multi-region op as a whole (with its own block_id) as the dep
+    // consumer, rather than walking into its nested regions.
+    for (auto &blockPair : blocks) {
+        Value blockKey = blockPair.first;
+        int blockId = outputToBlockId.lookup(blockKey);
+
+        for (Operation *op : blockPair.second.ops) {
+            if (op->getNumRegions() < 2)
+                continue;
+
+            for (Region &region : op->getRegions()) {
+                if (region.empty())
+                    continue;
+                auto yieldOp = dyn_cast<scf::YieldOp>(region.back().getTerminator());
+                if (!yieldOp)
+                    continue;
+                for (Value operand : yieldOp->getOperands()) {
+                    if (outputToBlockId.count(operand) && outputToBlockId[operand] != blockId &&
+                        !llvm::is_contained(depValueMap[blockKey], operand)) {
+                        depValueMap[blockKey].push_back(operand);
+                    }
+                }
+            }
+        }
     }
 
     return 0;
@@ -412,7 +478,7 @@ SmallVector<Value> collectScalarDeps(DenseMap<Value, SmallVector<Value>> &depVal
             SmallVector<Operation *> depUsers = userIt->second;
             bool hasCrossBlockUser = false;
             for (Operation *depUser : depUsers) {
-                int userId = getSsbufferId(depUser);
+                int userId = getOutermostSsbufferId(depUser);
                 if (userId < 0 || userId != producerId) {
                     hasCrossBlockUser = true;
                     break;
@@ -803,7 +869,7 @@ static SmallVector<Operation *> collectCrossBlockUsers(Value depVal, int produce
         return crossBlockUsers;
 
     for (Operation *depUser : userIt->second) {
-        int userId = getSsbufferId(depUser);
+        int userId = getOutermostSsbufferId(depUser);
         if ((userId < 0 || userId != producerId) && isInsideMainLoopForOpTraverse(depUser))
             crossBlockUsers.push_back(depUser);
     }
@@ -1018,7 +1084,7 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
     DenseMap<int, Value> processedBlockSelections;
 
     for (Operation *depUser : depUsers) {
-        int userBlockId = getSsbufferId(depUser);
+        int userBlockId = getOutermostSsbufferId(depUser);
         if (userBlockId < 0 || userBlockId == producerId)
             continue;
 
@@ -1103,7 +1169,7 @@ static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Va
             // Check if all users are in the same block
             bool allUsersSameBlock = true;
             for (Operation *depUser : depUsers) {
-                int userId = getSsbufferId(depUser);
+                int userId = getOutermostSsbufferId(depUser);
                 if (userId < 0 || userId != producerId) {
                     allUsersSameBlock = false;
                     break;
