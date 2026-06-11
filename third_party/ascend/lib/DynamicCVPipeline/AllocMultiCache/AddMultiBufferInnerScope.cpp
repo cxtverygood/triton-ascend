@@ -442,6 +442,27 @@ DenseMap<Value, SmallVector<Operation *>> buildDepUserMap(DenseMap<Value, InnerB
     return depUserMap;
 }
 
+// Check if depVal matches the special pattern: linalg::FillOp whose outs comes
+// from a tensor::EmptyOp. When this pattern is detected, the pass can avoid
+// allocating a multi-buffer (alloc + copy + select + to_tensor) by cloning
+// the empty+fill ops to the consumer's position instead.
+static bool isEmptyFillPattern(Value depVal)
+{
+    Operation *defOp = depVal.getDefiningOp();
+    auto fillOp = dyn_cast<linalg::FillOp>(defOp);
+    if (!fillOp)
+        return false;
+
+    if (fillOp.getOutputs().empty())
+        return false;
+
+    Value outs = fillOp.getOutputs()[0];
+    if (!outs || !isa_and_nonnull<tensor::EmptyOp>(outs.getDefiningOp()))
+        return false;
+
+    return true;
+}
+
 SmallVector<Value> collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap)
 {
     SmallVector<Value> valueList;
@@ -460,6 +481,11 @@ SmallVector<Value> collectBufferValues(DenseMap<Value, SmallVector<Value>> &depV
 
             // Skip tensor::EmptyOp - it should only get dep_mark, not buffer allocation
             if (isa<tensor::EmptyOp>(op))
+                continue;
+
+            // Skip tensor::EmptyOp + linalg::FillOp pattern - it gets cloned
+            // to the consumer's position instead of being multi-buffered
+            if (isEmptyFillPattern(depVal))
                 continue;
 
             valueList.push_back(depVal);
@@ -1345,27 +1371,6 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
     return 0;
 }
 
-// Check if depVal matches the special pattern: linalg::FillOp whose outs comes
-// from a tensor::EmptyOp. When this pattern is detected, the pass can avoid
-// allocating a multi-buffer (alloc + copy + select + to_tensor) by cloning
-// the empty+fill ops to the consumer's position instead.
-static bool isEmptyFillPattern(Value depVal)
-{
-    Operation *defOp = depVal.getDefiningOp();
-    auto fillOp = dyn_cast<linalg::FillOp>(defOp);
-    if (!fillOp)
-        return false;
-
-    if (fillOp.getOutputs().empty())
-        return false;
-
-    Value outs = fillOp.getOutputs()[0];
-    if (!outs || !isa_and_nonnull<tensor::EmptyOp>(outs.getDefiningOp()))
-        return false;
-
-    return true;
-}
-
 // Special handling for the tensor::EmptyOp + linalg::FillOp pattern:
 // Clone the empty+fill pair into each consumer block (different from producerId),
 // and replace depVal usage in those consumers with the new linalg::FillOp result.
@@ -1377,8 +1382,6 @@ static int cloneEmptyFillToConsumers(Value depVal, int producerId,
 {
     auto fillOp = cast<linalg::FillOp>(depVal.getDefiningOp());
     auto origEmpty = cast<tensor::EmptyOp>(fillOp.getOutputs()[0].getDefiningOp());
-    Value fillInput = fillOp.getInputs()[0];
-    auto tensorType = origEmpty.getType();
 
     auto userIt = depUserMap.find(depVal);
     if (userIt == depUserMap.end())
@@ -1387,8 +1390,8 @@ static int cloneEmptyFillToConsumers(Value depVal, int producerId,
     // Group users by their consumer block_id (skip users in the producer's own block)
     DenseMap<int, SmallVector<Operation *>> opsByBlockId;
     for (Operation *user : userIt->second) {
-        int userBlockId = getSsbufferId(user);
-        if (userBlockId < 0 || userBlockId == producerId)
+        auto userBlockId = getOpBlockId(user);
+        if (!userBlockId.has_value() || *userBlockId == producerId)
             continue;
         // Only keep users that still use depVal (not already replaced)
         bool stillUses = false;
@@ -1400,7 +1403,7 @@ static int cloneEmptyFillToConsumers(Value depVal, int producerId,
         }
         if (!stillUses)
             continue;
-        opsByBlockId[userBlockId].push_back(user);
+        opsByBlockId[*userBlockId].push_back(user);
     }
 
     for (auto &p : opsByBlockId) {
@@ -1411,20 +1414,22 @@ static int cloneEmptyFillToConsumers(Value depVal, int producerId,
 
         Operation *firstUser = users.front();
         builder.setInsertionPoint(firstUser);
-        Location loc = firstUser->getLoc();
 
         // Clone tensor::EmptyOp and tag with consumer's block_id
-        auto newEmpty = builder.create<tensor::EmptyOp>(
-            loc, tensorType.getShape(), tensorType.getElementType());
+        IRMapping mapper;
+        Operation *newEmpty = builder.clone(*origEmpty, mapper);
         newEmpty->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
 
+        // Map origEmpty's result to the new empty so the cloned fill's outs
+        // operand is rewired to point at the cloned empty.
+        mapper.map(origEmpty->getResult(0), newEmpty->getResult(0));
+
         // Clone linalg::FillOp and tag with consumer's block_id
-        auto newFill = builder.create<linalg::FillOp>(
-            loc, ValueRange{fillInput}, ValueRange{newEmpty.getResult()});
+        Operation *newFill = builder.clone(*fillOp, mapper);
         newFill->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
 
         // Replace depVal with the new fill's result for all users in this block
-        Value newResult = newFill.getResult(0);
+        Value newResult = newFill->getResult(0);
         for (Operation *user : users) {
             user->replaceUsesOfWith(depVal, newResult);
         }
@@ -1494,7 +1499,7 @@ static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Va
             // empty+fill pair to each consumer's block instead of allocating
             // a multi-buffer.
             if (isEmptyFillPattern(depVal)) {
-                if (cloneEmptyFillToConsumers(depVal, producerId, depUserMap, globalBuilder) != 0)
+                if (cloneEmptyFillToConsumers(depVal, *producerId, depUserMap, globalBuilder) != 0)
                     return -1;
                 continue; // skip normal multi-buffer path
             }
