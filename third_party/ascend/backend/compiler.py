@@ -209,7 +209,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             force_simt_template
         )
         ascend.passes.ttir.add_triton_to_hivm(pm)
-        ascend.passes.ttir.add_triton_to_hfusion(pm)
+        ascend.passes.ttir.add_triton_to_hfusion(
+            pm,
+            compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(
@@ -1004,6 +1006,9 @@ class NPUOptions:
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
+    # superblocking factor
+    superblock_factor: int = 0
+
     def __post_init__(self):
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":
@@ -1079,6 +1084,8 @@ def ttir_to_npubin(mod, metadata, opt):
             # cap keys off the same env switch, so the two stay in sync.
             if _is_auto_map_parallel_blocks_enabled():
                 _compile_option_list += ["--enable-auto-blockify-loop"]
+                if opt.superblock_factor > 0:
+                    _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = (
