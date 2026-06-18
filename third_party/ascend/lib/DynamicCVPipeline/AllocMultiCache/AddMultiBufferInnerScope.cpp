@@ -217,6 +217,15 @@ static void collectDepValue(Value operand, Block *body, Operation *currentOp,
 
     if (!outputToBlockId.count(operand))
         return;
+    // Ops that have no results (e.g. bufferization.materialize_in_destination,
+    // memref.copy) are now included in the block op list so their tensor
+    // operands can be tracked, but their memref operands are typically write
+    // targets or transfer destinations that the multi-buffer path does not
+    // support (hasMemrefDepValue would fail the pass). Drop only the memref
+    // operands of result-less ops; ops with results keep their normal
+    // behavior so the memref-dep fallback UT still fires.
+    if (isa<MemRefType>(operand.getType()) && currentOp->getNumResults() == 0)
+        return;
     auto currentOutermost = getOutermostSsbufferId(currentOp);
     auto operandOutermost = getOutermostSsbufferId(operand.getDefiningOp());
     if (currentOutermost.has_value() && currentOutermost == operandOutermost)
@@ -295,6 +304,24 @@ static int groupOpsBySsbufferId(SmallVector<Operation *> &allOps,
         }
         opsById[*id].push_back(op);
     }
+
+    // Second pass: also include ops with no results. opsByValue keys on
+    // op->getResult(), so result-less ops (e.g.
+    // bufferization.materialize_in_destination, memref.copy,
+    // hivm.hir.sync_block_*) are silently missed and their operands —
+    // including cross-block tensor deps — never get registered with
+    // collectDepValue. They are appended to opsById after the result-having
+    // ops so the existing intra-block ordering is preserved.
+    for (Operation *op : allOps) {
+        if (op->getNumResults() != 0)
+            continue;
+        if (!seen.insert(op).second)
+            continue;
+        auto id = getOpBlockId(op);
+        if (!id.has_value())
+            continue;
+        opsById[*id].push_back(op);
+    }
     return 0;
 }
 
@@ -362,7 +389,20 @@ static int collectInnerBlockInfo(scf::ForOp forOp, DenseMap<Value, InnerBlockInf
     // (e.g. scf.if) are included so their scalar deps get tracked; cross-block
     // judgment still attributes them to the ifOp via getOutermostSsbufferId.
     for (auto &p : opsById) {
-        Value groupKey = p.second.front()->getResult(0);
+        if (p.second.empty())
+            continue;
+        // The map key must be a Value. The block may now contain result-less
+        // ops (e.g. bufferization.materialize_in_destination), so find an
+        // op with a result to use as the key. If none, skip — such a block
+        // has no defs to be referenced by other blocks.
+        Operation *keyOp = p.second.front();
+        if (keyOp->getNumResults() == 0) {
+            auto it = llvm::find_if(p.second, [](Operation *op) { return op->getNumResults() > 0; });
+            if (it == p.second.end())
+                continue;
+            keyOp = *it;
+        }
+        Value groupKey = keyOp->getResult(0);
         InnerBlockInfo bi;
         bi.blockId = groupKey;
         bi.ops = p.second;
@@ -1438,6 +1478,69 @@ static int cloneEmptyFillToConsumers(Value depVal, int producerId,
     return 0;
 }
 
+// Special handling for cross-block tensor deps with dynamic shape:
+// Clone the dep-defining op to each consumer's block and rewire the
+// consumer to use the local clone. The multi-buffer path can't handle
+// dynamic shapes (insertBuffersBeforeFor would build memref.alloc with
+// the static shape and fail the verifier), so cloning is the
+// alternative. Operands of the producer op (e.g. offsets for
+// tensor.extract_slice) dominate the clone insertion point, so the
+// clone can reference them as-is.
+static int cloneDynamicShapeDepToConsumers(Value depVal, int producerId,
+                                           DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+                                           OpBuilder &builder)
+{
+    Operation *origProducer = depVal.getDefiningOp();
+    if (!origProducer)
+        return 0;
+
+    auto userIt = depUserMap.find(depVal);
+    if (userIt == depUserMap.end())
+        return 0;
+
+    // Group users by their consumer block_id (skip users in the producer's own block)
+    DenseMap<int, SmallVector<Operation *>> opsByBlockId;
+    for (Operation *user : userIt->second) {
+        auto userBlockId = getOpBlockId(user);
+        if (!userBlockId.has_value() || *userBlockId == producerId)
+            continue;
+        // Only keep users that still use depVal (not already replaced)
+        bool stillUses = false;
+        for (OpOperand &opnd : user->getOpOperands()) {
+            if (opnd.get() == depVal) {
+                stillUses = true;
+                break;
+            }
+        }
+        if (!stillUses)
+            continue;
+        opsByBlockId[*userBlockId].push_back(user);
+    }
+
+    for (auto &p : opsByBlockId) {
+        int userBlockId = p.first;
+        auto &users = p.second;
+        if (users.empty())
+            continue;
+
+        Operation *firstUser = users.front();
+        builder.setInsertionPoint(firstUser);
+
+        // Clone the producer op and tag with consumer's block_id
+        Operation *newProducer = builder.clone(*origProducer);
+        newProducer->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
+
+        // Replace depVal with the cloned producer's result for all users
+        // in this block
+        Value newResult = newProducer->getResult(0);
+        for (Operation *user : users) {
+            user->replaceUsesOfWith(depVal, newResult);
+        }
+    }
+
+    return 0;
+}
+
 // Process cross-block tensor dependencies for double buffering
 static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Value, InnerBlockInfo> &blocks,
                                      DenseMap<Value, SmallVector<Value>> &depValueMap,
@@ -1504,6 +1607,19 @@ static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Va
                 continue; // skip normal multi-buffer path
             }
 
+            // Dynamic-shape tensor deps: clone the producer op to each
+            // consumer's block and rewire the consumer. The multi-buffer
+            // path can't handle dynamic shapes because
+            // insertBuffersBeforeFor would build memref.alloc with a
+            // static shape and fail the verifier.
+            auto depShapedType = dyn_cast<ShapedType>(depVal.getType());
+            if (depShapedType &&
+                llvm::any_of(depShapedType.getShape(), [](int64_t d) { return d == ShapedType::kDynamic; })) {
+                if (cloneDynamicShapeDepToConsumers(depVal, *producerId, depUserMap, globalBuilder) != 0)
+                    return -1;
+                continue; // skip normal multi-buffer path
+            }
+
             // Process cross-block dependency with double buffering
             if (processDepVal(depVal, mainLoopForOp, bufferMap, depUserMap, globalBuilder, *producerId, groupId) != 0)
                 return -1;
@@ -1526,6 +1642,14 @@ static BufferMap insertBuffersBeforeFor(mlir::scf::ForOp forOp, SmallVector<Valu
 
     for (Value depVal : valueList) {
         ShapedType shapedType = cast<ShapedType>(depVal.getType());
+        // Skip dynamic-shape deps: they get cloned to consumer blocks in
+        // processTensorDependencies instead of multi-buffered, because
+        // memref.alloc needs a static shape and the dynamic dims come
+        // from operands that aren't available here.
+        if (llvm::any_of(shapedType.getShape(), [](int64_t d) { return d == ShapedType::kDynamic; })) {
+            groupId++;
+            continue;
+        }
         Type elemType = shapedType.getElementType();
         AddressSpace addrSpace = AddressSpace::UB;
 
