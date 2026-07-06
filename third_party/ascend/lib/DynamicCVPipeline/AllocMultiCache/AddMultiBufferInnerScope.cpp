@@ -1319,9 +1319,22 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
         return 0;
     SmallVector<Operation *> depUsers = userIt->second;
 
-    // Create producer
+    // Create producer. Place the producer chain at the end of the contiguous
+    // region of ops sharing the dep def op's block_id, so that producer logic
+    // (scf.if + hivm.hir.copy + arith.remsi/cmpi) is grouped with the rest of
+    // block_id=X ops rather than scattered across the main_loop body or pushed
+    // to scf.yield.
+    Operation *producerInsertAfter = depDefinedOp;
+    if (auto depBlockIdAttr = depDefinedOp->getAttrOfType<IntegerAttr>(kBlockId)) {
+        int64_t depBlockId = depBlockIdAttr.getInt();
+        for (Operation &op : depDefinedOp->getBlock()->getOperations()) {
+            auto opBlockIdAttr = op.getAttrOfType<IntegerAttr>(kBlockId);
+            if (opBlockIdAttr && opBlockIdAttr.getInt() == depBlockId)
+                producerInsertAfter = &op;
+        }
+    }
     OpBuilder producedBuffers(mainLoopForOp.getContext());
-    producedBuffers.setInsertionPointAfter(depDefinedOp);
+    producedBuffers.setInsertionPointAfter(producerInsertAfter);
     SmallVector<Operation *> producerNewOps = insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp);
     addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
     if (buffers.size() > kBufferCountOne) {
