@@ -1359,9 +1359,22 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
             continue;
 
         if (isMultiRegionConsumerFromYield(depUser, depVal)) {
-            // Multi-region op: process independently
+            // Multi-region op: process independently. Place the consumer chain
+            // at the beginning of the dep-user's "virtual block" (first op in
+            // this Block with the same ssbuffer.block_id as the dep user).
+            Operation *consumerInsertBefore = depUser;
+            if (auto userBlockIdAttr = depUser->getAttrOfType<IntegerAttr>(kBlockId)) {
+                int64_t userBlockIdVal = userBlockIdAttr.getInt();
+                for (Operation &op : depUser->getBlock()->getOperations()) {
+                    auto opBlockIdAttr = op.getAttrOfType<IntegerAttr>(kBlockId);
+                    if (opBlockIdAttr && opBlockIdAttr.getInt() == userBlockIdVal) {
+                        consumerInsertBefore = &op;
+                        break;
+                    }
+                }
+            }
             OpBuilder consumedBuilder(mainLoopForOp.getContext());
-            consumedBuilder.setInsertionPoint(depUser);
+            consumedBuilder.setInsertionPoint(consumerInsertBefore);
 
             if (int ret = processMultiRegionAllYields(consumedBuilder, depVal, buffers, mainLoopForOp,
                                                      depUser, *userBlockId, groupId))
@@ -1395,9 +1408,27 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
             if (opsInRegion.empty())
                 continue;
 
-            Operation *firstOp = opsInRegion.front();
+            // Insert consumer chain at the beginning of the dep-user's
+            // "virtual block" (the contiguous block_id=X region in this
+            // Block that contains the dep user). The block_id used is the
+            // dep user's direct ssbuffer.block_id attribute. This keeps the
+            // consumer chain grouped with the rest of block_id=X ops at the
+            // start of the region, mirroring the producer-side
+            // "end of block_id=X region" placement.
+            Operation *firstDepUser = opsInRegion.front();
+            Operation *consumerInsertBefore = firstDepUser;
+            if (auto userBlockIdAttr = firstDepUser->getAttrOfType<IntegerAttr>(kBlockId)) {
+                int64_t userBlockIdVal = userBlockIdAttr.getInt();
+                for (Operation &op : firstDepUser->getBlock()->getOperations()) {
+                    auto opBlockIdAttr = op.getAttrOfType<IntegerAttr>(kBlockId);
+                    if (opBlockIdAttr && opBlockIdAttr.getInt() == userBlockIdVal) {
+                        consumerInsertBefore = &op;
+                        break;
+                    }
+                }
+            }
             OpBuilder consumedBuilder(mainLoopForOp.getContext());
-            consumedBuilder.setInsertionPoint(firstOp);
+            consumedBuilder.setInsertionPoint(consumerInsertBefore);
 
             if (int ret = processNormalConsumerBlock(consumedBuilder, depVal, buffers, mainLoopForOp,
                                                    opsInRegion, userBlockId, groupId, globalBuilder))
