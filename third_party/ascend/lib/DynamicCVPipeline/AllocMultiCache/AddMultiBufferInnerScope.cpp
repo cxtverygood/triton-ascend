@@ -70,8 +70,12 @@ constexpr int kBufferCountOne = 1;
 //
 // This keeps the producer/consumer chains grouped with their block_id region
 // rather than interleaved with intermediate compute ops.
-constexpr bool kInsertAtBlockIdBoundary = true;
-
+//
+// The toggle is read from a module-level attribute
+// `CVPipeline::kInsertionOptimization` (i.e. "ssbuffer.insertionOptimization").
+// Python callers set it via `set_enable_buffer_insert_optimization` in
+// `triton_ascend.cc`, which writes the attribute onto the ModuleOp. The
+// attribute is checked inline at each `processDepVal` call site below.
 namespace mlir {
 namespace triton {
 
@@ -1369,13 +1373,20 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
         return 0;
     SmallVector<Operation *> depUsers = userIt->second;
 
+    // Read the module-level `ssbuffer.insertionOptimization` attribute inline so
+    // processDepVal can be called multiple times in the same pass run and stay
+    // in sync with whatever the Python caller last wrote onto the ModuleOp.
+    bool enableOpt = false;
+    if (mlir::ModuleOp mod = mainLoopForOp->getParentOfType<mlir::ModuleOp>())
+        enableOpt = mod->hasAttr(CVPipeline::kInsertionOptimization);
+
     // Create producer
     OpBuilder producedBuffers(mainLoopForOp.getContext());
-    // When kInsertAtBlockIdBoundary is on, place the producer chain at the end
+    // When enable_buffer_insert_optimization is on, place the producer chain at the end
     // of depDefinedOp's block_id=X region (after the last op with that
     // block_id). Otherwise keep the original "right after depDefinedOp" anchor.
     Operation *producerAnchor = depDefinedOp;
-    if (kInsertAtBlockIdBoundary) {
+    if (enableOpt) {
         if (auto prodId = getOpBlockId(depDefinedOp); prodId.has_value()) {
             if (Operation *lastInRegion = findLastOpWithBlockIdInBlock(depDefinedOp, *prodId))
                 producerAnchor = lastInRegion;
@@ -1408,11 +1419,11 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
         if (isMultiRegionConsumerFromYield(depUser, depVal)) {
             // Multi-region op: process independently
             OpBuilder consumedBuilder(mainLoopForOp.getContext());
-            // When kInsertAtBlockIdBoundary is on, place the consumer chain at
+            // When enable_buffer_insert_optimization is on, place the consumer chain at
             // the start of depUser's block_id=X region (before the first op
             // with that block_id). Otherwise keep "right before depUser".
             Operation *consumerAnchor = depUser;
-            if (kInsertAtBlockIdBoundary) {
+            if (enableOpt) {
                 if (auto userId = getOpBlockId(depUser); userId.has_value()) {
                     if (Operation *firstInRegion = findFirstOpWithBlockIdInBlock(depUser, *userId))
                         consumerAnchor = firstInRegion;
@@ -1454,11 +1465,11 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
 
             Operation *firstOp = opsInRegion.front();
             OpBuilder consumedBuilder(mainLoopForOp.getContext());
-            // When kInsertAtBlockIdBoundary is on, place the consumer chain at
+            // When enable_buffer_insert_optimization is on, place the consumer chain at
             // the start of the dep user's block_id=X region (before the first
             // op with that block_id). Otherwise keep "right before firstOp".
             Operation *consumerAnchor = firstOp;
-            if (kInsertAtBlockIdBoundary) {
+            if (enableOpt) {
                 if (auto userId = getOpBlockId(firstOp); userId.has_value()) {
                     if (Operation *firstInRegion = findFirstOpWithBlockIdInBlock(firstOp, *userId))
                         consumerAnchor = firstInRegion;
