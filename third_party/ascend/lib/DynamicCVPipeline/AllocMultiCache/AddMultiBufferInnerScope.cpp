@@ -57,6 +57,33 @@ using BufferMap = DenseMap<Value, SmallVector<BufferPair>>;
 // Buffer count constants
 constexpr int kBufferCountOne = 1;
 
+// Cached counter computation for a (Block*, block_id). Sharing the arith
+// operations across all producer/consumer chains in the same (Block*, block_id)
+// keeps the IR compact: chains no longer duplicate the same arith.constant
+// N / arith.remsi / arith.constant 0 / arith.cmpi quartet per dep value.
+struct CachedBufferIndex {
+    Value idx;                  // arith.remsi(iterCount, N) result
+    Value cond0;                // arith.cmpi eq idx, 0 result
+    Operation *lastChainEnd = nullptr;  // most recent scf.if in this (Block, block_id)
+};
+using BufferIndexCache = DenseMap<Block *, DenseMap<int, CachedBufferIndex>>;
+
+// True iff `value` is defined by an op that dominates the current insertion
+// point of `builder` (same block, defined before). Used to validate cache
+// hits when reusing a counter computation at a new insertion point.
+static bool cachedValueDominatesInsertionPoint(Value value, OpBuilder &builder)
+{
+    if (!value)
+        return false;
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+        return false;
+    Operation *insertPt = &*builder.getInsertionPoint();
+    if (insertPt->getBlock() != defOp->getBlock())
+        return false;
+    return defOp->isBeforeInBlock(insertPt);
+}
+
 namespace mlir {
 namespace triton {
 
@@ -844,23 +871,25 @@ static int buildIfChainTwoBuffers(OpBuilder &builder, Location loc, Value indexV
                                   SmallVector<Operation *> &newOps, SmallVector<Operation *> &outIfOps,
                                   function_ref<Operation *(OpBuilder &, Location, Value)> createOpFn,
                                   function_ref<Value(OpBuilder &, Location, Operation *)> yieldFn,
-                                  mlir::TypeRange types, bool hasResults, int blockId)
+                                  mlir::TypeRange types, bool hasResults, int blockId, Value precomputedCond = nullptr)
 {
-    // Create condition: index == 0
-    Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
-    Value firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, indexVal, zero);
+    // Create condition: index == 0, unless caller already supplied a cached cond0
+    Value firstCond = precomputedCond;
+    if (!firstCond) {
+        Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+        firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, indexVal, zero);
+        newOps.push_back(zero.getDefiningOp());
+        newOps.push_back(firstCond.getDefiningOp());
+        // Tag counter operations with block_id
+        if (blockId >= 0) {
+            zero.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+            firstCond.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+        }
+    }
     auto firstIf = builder.create<mlir::scf::IfOp>(loc, types, firstCond, true, true);
 
-    newOps.push_back(zero.getDefiningOp());
-    newOps.push_back(firstCond.getDefiningOp());
     newOps.push_back(firstIf);
     outIfOps.push_back(firstIf);
-
-    // Tag counter operations with block_id
-    if (blockId >= 0) {
-        zero.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
-        firstCond.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
-    }
 
     // Then branch: use buffer[0]
     builder.setInsertionPointToStart(&firstIf.getThenRegion().front());
@@ -885,19 +914,22 @@ static int buildIfChainMultiBuffers(OpBuilder &builder, Location loc, Value inde
                                     SmallVector<Operation *> &newOps, SmallVector<Operation *> &outIfOps,
                                     function_ref<Operation *(OpBuilder &, Location, Value)> createOpFn,
                                     function_ref<Value(OpBuilder &, Location, Operation *)> yieldFn,
-                                    mlir::TypeRange types, bool hasResults, int blockId)
+                                    mlir::TypeRange types, bool hasResults, int blockId, Value precomputedCond = nullptr)
 {
     int N = buffers.size();
 
-    // Create rootIf (idx == 0)
-    Value zeroVal = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
-    Value firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, indexVal, zeroVal);
-    if (blockId >= 0) {
-        zeroVal.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
-        firstCond.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+    // Create rootIf (idx == 0), unless caller already supplied a cached cond0
+    Value firstCond = precomputedCond;
+    if (!firstCond) {
+        Value zeroVal = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+        firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, indexVal, zeroVal);
+        if (blockId >= 0) {
+            zeroVal.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+            firstCond.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+        }
+        newOps.push_back(zeroVal.getDefiningOp());
+        newOps.push_back(firstCond.getDefiningOp());
     }
-    newOps.push_back(zeroVal.getDefiningOp());
-    newOps.push_back(firstCond.getDefiningOp());
 
     auto rootIf = builder.create<mlir::scf::IfOp>(loc, types, firstCond, true, true);
     if (!rootIf) return -1;
@@ -960,11 +992,14 @@ static int buildIfChainMultiBuffers(OpBuilder &builder, Location loc, Value inde
 }
 
 // Build if-else chain for buffer selection: if (idx==0) -> buf[0] else ... else -> buf[N-1]
+// If precomputedCond is provided, use it as the entry condition and skip the
+// (constant 0 + cmpi eq) creation; this is the consumer-side cache hit path.
 static int buildIfChain(OpBuilder &builder, Location loc, Value indexVal, SmallVector<BufferPair> &buffers,
                         SmallVector<Operation *> &newOps, SmallVector<Operation *> &outIfOps,
                         function_ref<Operation *(OpBuilder &, Location, Value)> createOpFn,
                         function_ref<Value(OpBuilder &, Location, Operation *)> yieldFn,
-                        std::optional<mlir::TypeRange> resultTypes = std::nullopt, int blockId = -1)
+                        std::optional<mlir::TypeRange> resultTypes = std::nullopt, int blockId = -1,
+                        Value precomputedCond = nullptr)
 {
     int N = buffers.size();
     auto types = resultTypes.value_or(mlir::TypeRange {});
@@ -972,34 +1007,54 @@ static int buildIfChain(OpBuilder &builder, Location loc, Value indexVal, SmallV
 
     if (N == 2) {
         return buildIfChainTwoBuffers(builder, loc, indexVal, buffers, newOps, outIfOps,
-                                       createOpFn, yieldFn, types, hasResults, blockId);
+                                       createOpFn, yieldFn, types, hasResults, blockId, precomputedCond);
     }
     return buildIfChainMultiBuffers(builder, loc, indexVal, buffers, newOps, outIfOps,
-                                    createOpFn, yieldFn, types, hasResults, blockId);
+                                    createOpFn, yieldFn, types, hasResults, blockId, precomputedCond);
 }
 
-// Compute buffer index: iterCount % N
-static Value computeBufferIndex(OpBuilder &builder, mlir::scf::ForOp forOp, Location loc, int N,
-                                SmallVector<Operation *> *newOps, int blockId = -1)
+// Compute buffer index: iterCount % N, and the cond0 (idx == 0) that drives
+// the if-else chain. When a precomputed value is supplied (cache hit), the
+// corresponding IR is skipped and the cached value is reused. Callers
+// responsible for the cache must verify dominance before passing them in.
+static std::pair<Value, Value> computeBufferIndex(OpBuilder &builder, mlir::scf::ForOp forOp, Location loc, int N,
+                                                   SmallVector<Operation *> *newOps, int blockId = -1,
+                                                   Value precomputedIdx = nullptr, Value precomputedCond0 = nullptr)
 {
-    Value iterCount = getIterCount(builder, forOp, loc, newOps, blockId);
-    Value Nval = builder.create<mlir::arith::ConstantIntOp>(loc, N, 32);
-    Value bufIdx = builder.create<mlir::arith::RemSIOp>(loc, iterCount, Nval);
-    if (newOps) {
-        newOps->push_back(Nval.getDefiningOp());
-        newOps->push_back(bufIdx.getDefiningOp());
+    Value bufIdx = precomputedIdx;
+    if (!bufIdx) {
+        Value iterCount = getIterCount(builder, forOp, loc, newOps, blockId);
+        Value Nval = builder.create<mlir::arith::ConstantIntOp>(loc, N, 32);
+        bufIdx = builder.create<mlir::arith::RemSIOp>(loc, iterCount, Nval);
+        if (newOps) {
+            newOps->push_back(Nval.getDefiningOp());
+            newOps->push_back(bufIdx.getDefiningOp());
+        }
+        if (blockId >= 0) {
+            Nval.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+            bufIdx.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+        }
     }
-    // Tag counter operations with block_id
-    if (blockId >= 0) {
-        MLIRContext *ctx = builder.getContext();
-        Nval.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
-        bufIdx.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+
+    Value cond0 = precomputedCond0;
+    if (!cond0) {
+        Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+        cond0 = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, bufIdx, zero);
+        if (newOps) {
+            newOps->push_back(zero.getDefiningOp());
+            newOps->push_back(cond0.getDefiningOp());
+        }
+        if (blockId >= 0) {
+            zero.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+            cond0.getDefiningOp()->setAttr(kBlockId, builder.getI32IntegerAttr(blockId));
+        }
     }
-    return bufIdx;
+
+    return {bufIdx, cond0};
 }
 
 static SmallVector<Operation *> insertProducerLogic(OpBuilder &builder, Value depVal, SmallVector<BufferPair> &buffers,
-                                                    mlir::scf::ForOp forOp)
+                                                    mlir::scf::ForOp forOp, BufferIndexCache *cache, int blockId = -1)
 {
     SmallVector<Operation *> newOps;
     int N = buffers.size();
@@ -1014,7 +1069,27 @@ static SmallVector<Operation *> insertProducerLogic(OpBuilder &builder, Value de
         return newOps;
     }
 
-    Value bufIdx = computeBufferIndex(builder, forOp, loc, N, &newOps);
+    // Cache lookup: same (Block, block_id) chains share the counter ops.
+    Value cachedIdx;
+    Value cachedCond;
+    if (cache && blockId >= 0) {
+        Block *blk = builder.getInsertionBlock();
+        auto blkIt = blk ? cache->find(blk) : cache->end();
+        if (blkIt != cache->end()) {
+            auto idIt = blkIt->second.find(blockId);
+            if (idIt != blkIt->second.end()) {
+                // Counter reuse requires that the cached cond0 dominates the
+                // current insertion point in the same block.
+                if (cachedValueDominatesInsertionPoint(idIt->second.cond0, builder)) {
+                    cachedIdx = idIt->second.idx;
+                    cachedCond = idIt->second.cond0;
+                }
+            }
+        }
+    }
+
+    auto [bufIdx, cond0] =
+        computeBufferIndex(builder, forOp, loc, N, &newOps, blockId, cachedIdx, cachedCond);
     SmallVector<Operation *> dummyOutIfOps;
     if (buildIfChain(
         builder, loc, bufIdx, buffers, newOps, dummyOutIfOps,
@@ -1022,8 +1097,16 @@ static SmallVector<Operation *> insertProducerLogic(OpBuilder &builder, Value de
             return b.create<hivm::CopyOp>(
                 l, mlir::TypeRange{}, depVal, buffer);
         },
-        nullptr) != 0) {
+        nullptr, std::nullopt, blockId, cond0) != 0) {
     return {};
+    }
+
+    // Record the chain's scf.if so the next chain in the same (Block, block_id)
+    // can chain its consumer side after it (if it lands at the region start).
+    if (cache && blockId >= 0 && !dummyOutIfOps.empty()) {
+        if (Block *blk = builder.getInsertionBlock()) {
+            (*cache)[blk][blockId] = CachedBufferIndex{bufIdx, cond0, dummyOutIfOps.front()};
+        }
     }
     return newOps;
 }
@@ -1048,7 +1131,7 @@ static mlir::bufferization::ToTensorOp createToTensorOp(OpBuilder &builder, Loca
 
 static int insertConsumerLogic(OpBuilder &builder, Value depVal, SmallVector<BufferPair> &buffers,
                                mlir::scf::ForOp forOp, SmallVector<Operation *> &outIfOps, int groupId = -1,
-                               int blockId = -1)
+                               int blockId = -1, BufferIndexCache *cache = nullptr)
 {
     SmallVector<Operation *> newOps;
     int N = buffers.size();
@@ -1063,7 +1146,37 @@ static int insertConsumerLogic(OpBuilder &builder, Value depVal, SmallVector<Buf
         return 0;
     }
 
-    Value readIdx = computeBufferIndex(builder, forOp, loc, N, &newOps, blockId);
+    // Cache lookup: same (Block, block_id) chains share the counter ops, and
+    // the new chain is appended right after the previous chain's scf.if when
+    // that scf.if sits at the region start (i.e. is itself a consumer chain).
+    Value cachedIdx;
+    Value cachedCond;
+    if (cache && blockId >= 0) {
+        Block *blk = builder.getInsertionBlock();
+        auto blkIt = blk ? cache->find(blk) : cache->end();
+        if (blkIt != cache->end()) {
+            auto idIt = blkIt->second.find(blockId);
+            if (idIt != blkIt->second.end()) {
+                if (cachedValueDominatesInsertionPoint(idIt->second.cond0, builder)) {
+                    cachedIdx = idIt->second.idx;
+                    cachedCond = idIt->second.cond0;
+                    // Chain after the previous scf.if only if it's at the
+                    // region start (i.e. before the first dep user). Producer
+                    // chains sit at the region end and are not on the same
+                    // side of the region.
+                    Operation *firstDepUser = &*builder.getInsertionPoint();
+                    if (idIt->second.lastChainEnd &&
+                        idIt->second.lastChainEnd->isBeforeInBlock(firstDepUser)) {
+                        builder.setInsertionPointAfter(idIt->second.lastChainEnd);
+                        loc = builder.getInsertionPoint()->getLoc();
+                    }
+                }
+            }
+        }
+    }
+
+    auto [readIdx, cond0] =
+        computeBufferIndex(builder, forOp, loc, N, &newOps, blockId, cachedIdx, cachedCond);
     auto memrefType = mlir::cast<mlir::MemRefType>(buffers[0].second.getType());
     auto tensorType = mlir::RankedTensorType::get(memrefType.getShape(), memrefType.getElementType());
     mlir::TypeRange resultTypes(tensorType);
@@ -1075,12 +1188,20 @@ static int insertConsumerLogic(OpBuilder &builder, Value depVal, SmallVector<Buf
         [&](OpBuilder &b, Location l, Operation *op) -> Value {
             return cast<mlir::bufferization::ToTensorOp>(op).getResult();
         },
-        resultTypes, blockId);
+        resultTypes, blockId, cond0);
     if (ret != 0) {
         return ret;
     }
     if (groupId >= 0 && !outIfOps.empty()) {
         outIfOps.front()->setAttr("ssbuffer.intraDeps", builder.getI32ArrayAttr({groupId, 0}));
+    }
+
+    // Track this chain's scf.if so the next consumer in the same
+    // (Block, block_id) can chain after it and reuse the counter ops.
+    if (cache && blockId >= 0 && !outIfOps.empty()) {
+        if (Block *blk = builder.getInsertionBlock()) {
+            (*cache)[blk][blockId] = CachedBufferIndex{readIdx, cond0, outIfOps.front()};
+        }
     }
     return 0;
 }
@@ -1146,7 +1267,7 @@ static Operation *insertBufferSelectionInRegion(OpBuilder &builder, Region &regi
     builder.setInsertionPointToStart(&region.front());
 
     // Compute buffer index
-    Value readIdx = computeBufferIndex(builder, forOp, loc, buffers.size(), nullptr, blockId);
+    auto [readIdx, cond0] = computeBufferIndex(builder, forOp, loc, buffers.size(), nullptr, blockId);
 
     // Build buffer selection if-else chain
     SmallVector<Operation *> newIfOps;
@@ -1159,7 +1280,7 @@ static Operation *insertBufferSelectionInRegion(OpBuilder &builder, Region &regi
         [&](OpBuilder &b, Location l, Operation *op) -> Value {
             return cast<mlir::bufferization::ToTensorOp>(op).getResult();
         },
-        tensorType, blockId);
+        tensorType, blockId, cond0);
     if (ret != 0)
         return nullptr;
 
@@ -1225,10 +1346,11 @@ static bool isMultiRegionConsumerFromYield(Operation *depUser, Value depVal)
 // Process normal consumer for a block: generate one buffer selection and share among all ops in the block
 static int processNormalConsumerBlock(OpBuilder &consumedBuilder, Value depVal, SmallVector<BufferPair> &buffers,
                                      mlir::scf::ForOp mainLoopForOp, SmallVector<Operation *> &opsInBlock,
-                                     int userBlockId, int groupId, OpBuilder &globalBuilder)
+                                     int userBlockId, int groupId, OpBuilder &globalBuilder,
+                                     BufferIndexCache *cache = nullptr)
 {
     SmallVector<Operation *> resultIfOps;
-    int ret = insertConsumerLogic(consumedBuilder, depVal, buffers, mainLoopForOp, resultIfOps, groupId, userBlockId);
+    int ret = insertConsumerLogic(consumedBuilder, depVal, buffers, mainLoopForOp, resultIfOps, groupId, userBlockId, cache);
     if (ret != 0)
         return -1;
 
@@ -1306,7 +1428,7 @@ static int processMultiRegionAllYields(OpBuilder &consumedBuilder, Value depVal,
 // Process producer and consumer for a single dependency value
 static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap &bufferMap,
                          DenseMap<Value, SmallVector<Operation *>> &depUserMap, OpBuilder &globalBuilder,
-                         int producerId, int groupId)
+                         int producerId, int groupId, BufferIndexCache *cache = nullptr)
 {
     Operation *depDefinedOp = depVal.getDefiningOp();
     if (!depDefinedOp)
@@ -1322,7 +1444,8 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
     // Create producer
     OpBuilder producedBuffers(mainLoopForOp.getContext());
     producedBuffers.setInsertionPointAfter(depDefinedOp);
-    SmallVector<Operation *> producerNewOps = insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp);
+    SmallVector<Operation *> producerNewOps =
+        insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp, cache, producerId);
     addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
     if (buffers.size() > kBufferCountOne) {
         for (auto *op : producerNewOps) {
@@ -1387,7 +1510,7 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp, BufferMap
             consumedBuilder.setInsertionPoint(firstOp);
 
             if (int ret = processNormalConsumerBlock(consumedBuilder, depVal, buffers, mainLoopForOp,
-                                                   opsInRegion, userBlockId, groupId, globalBuilder))
+                                                   opsInRegion, userBlockId, groupId, globalBuilder, cache))
                 return ret;
         }
     }
@@ -1542,7 +1665,7 @@ static int cloneEmptyFillsInBlocks(scf::ForOp mainLoopForOp, DenseMap<Value, Inn
 static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Value, InnerBlockInfo> &blocks,
                                      DenseMap<Value, SmallVector<Value>> &depValueMap,
                                      DenseMap<Value, SmallVector<Operation *>> &depUserMap, BufferMap &bufferMap,
-                                     OpBuilder &globalBuilder, int &groupId)
+                                     OpBuilder &globalBuilder, int &groupId, BufferIndexCache &cache)
 {
     SmallVector<Operation *> seenOps;
 
@@ -1601,8 +1724,12 @@ static int processTensorDependencies(mlir::scf::ForOp mainLoopForOp, DenseMap<Va
             if (allUsersSameBlock)
                 continue;
 
-            // Process cross-block dependency with double buffering
-            if (processDepVal(depVal, mainLoopForOp, bufferMap, depUserMap, globalBuilder, *producerId, groupId) != 0)
+            // Process cross-block dependency with double buffering. The cache
+            // accumulates counter computations across all depVals processed
+            // in this main_loop, so multiple producer/consumer chains in the
+            // same (Block, block_id) share the same arith.remsi / arith.cmpi.
+            if (processDepVal(depVal, mainLoopForOp, bufferMap, depUserMap, globalBuilder, *producerId, groupId,
+                              &cache) != 0)
                 return -1;
             groupId++;
         }
@@ -1743,7 +1870,14 @@ static int addInnerMultiBuffer(mlir::scf::ForOp mainLoopForOp, OpBuilder &builde
 
     markScalarDeps(scalarValueList, depUserMap, globalBuilder, 1);
 
-    if (processTensorDependencies(mainLoopForOp, blocks, depValueMap, depUserMap, bufferMap, globalBuilder, groupId) !=
+    // Cache for the arith counter computations (remsi + cmpi) used by the
+    // if-else chains. Sharing them across producer/consumer chains in the
+    // same (Block, block_id) keeps the IR compact: one set of 4 arith ops
+    // per (Block, block_id) instead of one set per dep value.
+    BufferIndexCache bufferIndexCache;
+
+    if (processTensorDependencies(mainLoopForOp, blocks, depValueMap, depUserMap, bufferMap, globalBuilder, groupId,
+                                  bufferIndexCache) !=
         0) {
         return -1;
     }
