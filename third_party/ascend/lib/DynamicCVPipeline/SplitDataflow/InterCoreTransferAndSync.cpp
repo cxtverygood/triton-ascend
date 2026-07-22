@@ -623,7 +623,8 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
                                                 ndLayout  // dstLayout
           );
       memValue = convertLayoutOp.getResult();
-      attachTransferTags(convertLayoutOp, cubeBlockId, "CUBE", transferIndex);attachCrossCoreDeps(convertLayoutOp, transferIndex, nextId, builder);
+      attachTransferTags(convertLayoutOp, cubeBlockId, "CUBE", transferIndex);
+      attachCrossCoreDeps(convertLayoutOp, transferIndex, nextId, builder);
     }
     auto plainMemrefType = MemRefType::get(srcTensorType.getShape(), elemType);
     auto memspaceCastOp = builder.create<memref::MemorySpaceCastOp>(

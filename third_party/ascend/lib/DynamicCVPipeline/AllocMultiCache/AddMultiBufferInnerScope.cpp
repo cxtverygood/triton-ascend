@@ -1465,9 +1465,8 @@ static int processDepVal(Value depVal, mlir::scf::ForOp mainLoopForOp,
     }
   }
   producedBuffers.setInsertionPointAfter(producerAnchor);
-  SmallVector<Operation *> producerNewOps =
-      insertProducerLogic(producedBuffers, depVal, buffers, mainLoopForOp,
-                          groupId);
+  SmallVector<Operation *> producerNewOps = insertProducerLogic(
+      producedBuffers, depVal, buffers, mainLoopForOp, groupId);
   addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
   if (buffers.size() > kBufferCountOne) {
     for (auto *op : producerNewOps) {

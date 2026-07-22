@@ -33,8 +33,8 @@ namespace triton {
 // Pull attribute-name constants from CVPipeline::Utils.h so the local
 // shadowed #defines (kTransferId, kCrossCoreDeps) are no longer needed and the
 // canonical name lives in one place.
-using mlir::CVPipeline::kTransferId;
 using mlir::CVPipeline::kCrossCoreDeps;
+using mlir::CVPipeline::kTransferId;
 
 // Maximum number of flag allocation attempts per transfer group
 static constexpr int kMaxFlagAttempts = 16;
@@ -270,8 +270,9 @@ static int tagLoadStoreOpsWithCrossDeps(
         Value ptr = storeOp.getOperand(1);
         if (auto *ptrDefOp = ptr.getDefiningOp()) {
           ptrDefOp->setAttr(
-              kCrossCoreDeps, builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                                builder.getI32IntegerAttr(1)}));
+              kCrossCoreDeps,
+              builder.getArrayAttr({builder.getI32IntegerAttr(tid),
+                                    builder.getI32IntegerAttr(1)}));
           LDBG("Tagged ptr-defining-op with crossDeps={tid=" << tid << ", 1}");
         }
       } else if (auto loadOp = dyn_cast<mlir::LLVM::LoadOp>(op)) {
@@ -718,15 +719,13 @@ static int addConsumerCrossDepsTags(TransferGroupInfo &g, ModuleOp module) {
 
   if (consumerBuf.allocOp) {
     consumerBuf.allocOp->setAttr(
-        kCrossCoreDeps,
-        builder.getArrayAttr(
-            {builder.getI32IntegerAttr(g.tid), builder.getI32IntegerAttr(1)}));
+        kCrossCoreDeps, builder.getArrayAttr({builder.getI32IntegerAttr(g.tid),
+                                              builder.getI32IntegerAttr(1)}));
   }
   if (consumerChain.transferOp) {
     consumerChain.transferOp->setAttr(
-        kCrossCoreDeps,
-        builder.getArrayAttr(
-            {builder.getI32IntegerAttr(g.tid), builder.getI32IntegerAttr(0)}));
+        kCrossCoreDeps, builder.getArrayAttr({builder.getI32IntegerAttr(g.tid),
+                                              builder.getI32IntegerAttr(0)}));
   }
   return 0;
 }
@@ -862,8 +861,8 @@ static Operation *wrapTransferOpWithScfIfYield(Operation *transferOp,
   // scf.if is the polling-flow control structure, not the data-movement
   // behavior op — the producer role follows the inner fixpipe/copy clones.
   if (isProducer) {
-    auto crossDeps = builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                          builder.getI32IntegerAttr(1)});
+    auto crossDeps = builder.getArrayAttr(
+        {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
     thenCloned->setAttr(kCrossCoreDeps, crossDeps);
     elseCloned->setAttr(kCrossCoreDeps, crossDeps);
   }
@@ -918,8 +917,8 @@ static Operation *wrapTransferOpWithScfIfSimple(Operation *transferOp,
   // [tid, 1]. Mirror of wrapTransferOpWithScfIfYield: behavior op, not
   // the ifOp wrapper, carries the producer role.
   if (isProducer) {
-    auto crossDeps = builder.getArrayAttr({builder.getI32IntegerAttr(tid),
-                                          builder.getI32IntegerAttr(1)});
+    auto crossDeps = builder.getArrayAttr(
+        {builder.getI32IntegerAttr(tid), builder.getI32IntegerAttr(1)});
     thenCloned->setAttr(kCrossCoreDeps, crossDeps);
     elseCloned->setAttr(kCrossCoreDeps, crossDeps);
   }
