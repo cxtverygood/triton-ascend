@@ -26,11 +26,13 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -45,7 +47,17 @@ namespace triton {
 
 namespace {
 
-static bool findNearestConvergence(ArrayRef<Operation *> consumers,
+// True iff `op` lives in the same MLIR Region as `source`. Used to reject
+// merges whose BFS would cross a region-bearing op boundary (scf.for /
+// scf.while / scf.if / func.func / etc.) — every such op exposes its body
+// as a distinct Region, so plain pointer equality on getParentRegion()
+// catches all of them.
+static bool isInSameRegion(Operation *op, Operation *source) {
+  return op->getParentRegion() == source->getParentRegion();
+}
+
+static bool findNearestConvergence(Operation *source,
+                                   ArrayRef<Operation *> consumers,
                                    SmallVectorImpl<Operation *> &chainOps) {
   if (consumers.size() < 2) {
     return false;
@@ -73,12 +85,23 @@ static bool findNearestConvergence(ArrayRef<Operation *> consumers,
           CVPipeline::CoreType::VECTOR_ONLY) {
         continue;
       }
+      // Prune any traversal that crosses a region-bearing op boundary
+      // (scf.for / scf.while / scf.if / etc.). The merge is only valid
+      // when source and the entire reachable chain live in the same region.
+      if (!isInSameRegion(user, source)) {
+        continue;
+      }
       auto it = firstIdx.find(user);
       if (it == firstIdx.end()) {
         firstIdx[user] = myIdx;
         parent[user] = cur;
         bfsQueue.push_back({user, myIdx});
       } else if (it->second != myIdx) {
+        // Reject 1-step false convergence when `user` is itself a starting
+        // consumer — adjacent siblings are not a real two-branch merge.
+        if (llvm::is_contained(consumers, user)) {
+          continue;
+        }
         Operation *cons1 = consumers[it->second];
         Operation *cons2 = consumers[myIdx];
         Operation *convergenceOp = user;
@@ -116,6 +139,29 @@ static bool findNearestConvergence(ArrayRef<Operation *> consumers,
           }
         }
         chainOps.push_back(convergenceOp);
+
+        // Pull the convergence op's same-block VECTOR_ONLY direct users
+        // along so the moved convergence op doesn't leave its tail behind.
+        auto convBlockIdOpt = CVPipeline::getOpBlockId(convergenceOp);
+        if (convBlockIdOpt && *convBlockIdOpt >= 0) {
+          int convBlockId = *convBlockIdOpt;
+          for (Operation *user : convergenceOp->getUsers()) {
+            if (CVPipeline::getOpCoreType(user) !=
+                CVPipeline::CoreType::VECTOR_ONLY) {
+              continue;
+            }
+            if (!isInSameRegion(user, source)) {
+              continue;
+            }
+            auto userBidOpt = CVPipeline::getOpBlockId(user);
+            if (!userBidOpt || *userBidOpt != convBlockId) {
+              continue;
+            }
+            if (inChain.insert(user).second) {
+              chainOps.push_back(user);
+            }
+          }
+        }
         return true;
       }
     }
@@ -132,9 +178,21 @@ static void tryMergeSource(Operation *source,
   }
   int srcBlockId = *srcBlockIdOpt;
 
+  // Skip constants as merge sources: they have no axis semantics and their
+  // many users routinely trigger trivial 1-step BFS convergence.
+  if (mlir::isa<mlir::arith::ConstantOp>(source)) {
+    return;
+  }
+
   SmallVector<Operation *> consumers;
   for (Operation *user : source->getUsers()) {
     if (CVPipeline::getOpCoreType(user) != CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    // Mirror the BFS guard: only consider consumers that share the same
+    // region as the source. Cross-region consumers can't reach a valid
+    // convergence without leaving the scope.
+    if (!isInSameRegion(user, source)) {
       continue;
     }
     auto bidOpt = CVPipeline::getOpBlockId(user);
@@ -148,7 +206,7 @@ static void tryMergeSource(Operation *source,
   }
 
   SmallVector<Operation *> chainOps;
-  if (!findNearestConvergence(consumers, chainOps)) {
+  if (!findNearestConvergence(source, consumers, chainOps)) {
     return;
   }
   LOG_DEBUG("[tryMergeSource] candidate source=" << *source << " chainSize="
