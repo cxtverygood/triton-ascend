@@ -30,19 +30,19 @@ func.func @constant_source_skipped(%arg0: i32, %arg1: i32) {
 // must also not perturb the chain. Here %src is a real tensor source at
 // block 28; the chain below is a legitimate same-source-different-axes
 // pattern and must still merge.
-func.func @constant_consumer_does_not_break_legit_chain(%arg0: tensor<32xf32>, %arg1: f32) {
+func.func @constant_consumer_does_not_break_legit_chain(%arg0: tensor<8xf32>, %arg1: f32) {
   %c0_i32 = arith.constant {ssbuffer.block_id = 31 : i32, ssbuffer.core_type = "VECTOR"} 0 : i32
 
-  // Source %src at block 28.
-  %src = arith.addf %arg1, %arg1 {ssbuffer.block_id = 28 : i32, ssbuffer.core_type = "VECTOR"} : f32
+  // Source %src at block 28 — tensor so the pass treats it as a candidate.
+  %src = arith.addf %arg0, %arg0 {ssbuffer.block_id = 28 : i32, ssbuffer.core_type = "VECTOR"} : tensor<8xf32>
 
   // Two consumers with a shared constant operand — they must still merge.
   // CHECK: arith.mulf {{.*}}ssbuffer.block_id = 28
-  %a = arith.mulf %src, %arg1 {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : f32
+  %a = arith.mulf %src, %arg0 {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : tensor<8xf32>
   // CHECK: arith.addf {{.*}}ssbuffer.block_id = 28
-  %b = arith.addf %src, %arg1 {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : f32
+  %b = arith.addf %src, %arg0 {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : tensor<8xf32>
   // CHECK: arith.subf {{.*}}ssbuffer.block_id = 28
-  %k = arith.subf %a, %b {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : f32
+  %k = arith.subf %a, %b {ssbuffer.block_id = 29 : i32, ssbuffer.core_type = "VECTOR"} : tensor<8xf32>
 
   return
 }
