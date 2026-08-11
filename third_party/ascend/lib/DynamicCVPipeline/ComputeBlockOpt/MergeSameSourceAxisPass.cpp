@@ -194,6 +194,34 @@ static void tryMergeSource(Operation *source,
   if (!findNearestConvergence(source, consumers, chainOps)) {
     return;
   }
+
+  // Guard: convergenceOp's upstream operands must all live in blocks that this
+  // merge will cover
+  Operation *convergenceOp = chainOps.front();
+  for (Value operand : convergenceOp->getOperands()) {
+    Operation *defOp = operand.getDefiningOp();
+    if (!defOp) {
+      continue;
+    }
+    if (!isInSameRegion(defOp, source)) {
+      continue;
+    }
+    if (defOp == source) {
+      continue;
+    }
+    if (llvm::is_contained(chainOps, defOp)) {
+      continue;
+    }
+    auto defBidOpt = CVPipeline::getOpBlockId(defOp);
+    if (defBidOpt && *defBidOpt == srcBlockId) {
+      continue;
+    }
+    LOG_DEBUG("[tryMergeSource] convergenceOp="
+              << *convergenceOp << " has unaligned upstream defOp=" << *defOp
+              << ", skip");
+    return;
+  }
+
   LOG_DEBUG("[tryMergeSource] candidate source=" << *source << " chainSize="
                                                  << chainOps.size());
 
