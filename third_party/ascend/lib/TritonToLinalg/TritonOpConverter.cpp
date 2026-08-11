@@ -2227,7 +2227,20 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   auto dstType = cast<RankedTensorType>(op.getType());
   auto elemTy = dstType.getElementType();
   auto inputPrec = op.getInputPrecision();
-
+  // Ascend does not support tf32;  map it to hf32 which provides similar
+  // functionality.HF32 is only valid for fp32 x fp32 inputs; for other
+  // dtypes, fall back to ieee.
+  if (inputPrec == InputPrecision::TF32) {
+    op->emitWarning("Ascend does not support tf32; map it to hf32.");
+    inputPrec = InputPrecision::HF32;
+  }
+  if (inputPrec == InputPrecision::HF32) {
+    auto opaElemTy = cast<RankedTensorType>(opa.getType()).getElementType();
+    auto opbElemTy = cast<RankedTensorType>(opb.getType()).getElementType();
+    if (!opaElemTy.isF32() || !opbElemTy.isF32()) {
+      inputPrec = InputPrecision::IEEE;
+    }
+  }
   auto createOp = [&](auto &&rewriter, ValueRange operands,
                       ValueRange results) -> Operation * {
     if (dstType.getRank() == 2)
@@ -3589,6 +3602,7 @@ HistogramConverter::matchAndRewrite(triton::HistogramOp op, OpAdaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
   Value input = adaptor.getSrc();
+  Value mask = adaptor.getMask();
   auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
   if (!resultType || !resultType.hasStaticShape()) {
     return rewriter.notifyMatchFailure(op,
@@ -3607,10 +3621,14 @@ HistogramConverter::matchAndRewrite(triton::HistogramOp op, OpAdaptor adaptor,
 
   Value numBinsVal = rewriter.create<arith::ConstantIntOp>(loc, numBins, 64);
 
+  SmallVector<Value, 3> inputs = {input, numBinsVal};
+  if (mask) {
+    inputs.push_back(mask);
+  }
+
   auto customOp = rewriter.create<hivm::CustomOp>(
-      loc, TypeRange{resultType}, "__builtin_histogram",
-      ValueRange{input, numBinsVal}, ValueRange{fillOp.getResult(0)},
-      ValueRange{});
+      loc, TypeRange{resultType}, "__builtin_histogram", ValueRange{inputs},
+      ValueRange{fillOp.getResult(0)}, ValueRange{});
 
   customOp->setAttr("symbol", rewriter.getStringAttr("__builtin_histogram"));
   customOp->setAttr(
