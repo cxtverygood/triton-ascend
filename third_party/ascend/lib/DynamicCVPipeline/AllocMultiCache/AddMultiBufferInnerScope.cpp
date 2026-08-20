@@ -275,6 +275,20 @@ groupOpsBySsbufferId(SmallVector<Operation *> &allOps,
     }
     opsById[*id].push_back(op);
   }
+  // Also register ops that carry ssbuffer.block_id but have no results
+  // (e.g. func.call, store-like ops). Without this, an op that is a pure
+  // consumer with no outputs never lands in opsById, so its operands are
+  // never walked in collectDepValue and any tensor dep into it (e.g. a
+  // tensor<...> operand passed to a func.call) is silently missed.
+  // outputToBlockId is unaffected — these ops aren't producers, so not
+  // mapping them is correct.
+  for (Operation *op : allOps) {
+    auto id = getOpBlockId(op);
+    if (!id.has_value() || !op->getResults().empty())
+      continue;
+    if (seen.insert(op).second)
+      opsById[*id].push_back(op);
+  }
   return 0;
 }
 
@@ -348,7 +362,20 @@ collectInnerBlockInfo(const MainLoop &loop,
   // (e.g. scf.if) are included so their scalar deps get tracked; cross-block
   // judgment still attributes them to the ifOp via getOutermostSsbufferId.
   for (auto &p : opsById) {
-    Value groupKey = p.second.front()->getResult(0);
+    // groupKey needs a Result. If the block has only no-result ops (e.g. only
+    // arith.constant, memref.copy with the block_id attr), there are no
+    // tensor deps to track here — skip the block. Result-bearing ops in
+    // other blocks are unaffected.
+    Operation *keyOp = nullptr;
+    for (Operation *op : p.second) {
+      if (!op->getResults().empty()) {
+        keyOp = op;
+        break;
+      }
+    }
+    if (!keyOp)
+      continue;
+    Value groupKey = keyOp->getResult(0);
     InnerBlockInfo bi;
     bi.blockId = groupKey;
     bi.ops = p.second;
