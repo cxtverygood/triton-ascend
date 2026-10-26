@@ -44,7 +44,9 @@ public:
   AddScalarPipeControlPass() = default;
   void runOnOperation() override;
 
-  llvm::StringRef getArgument() const final { return "add-scalar-pipe-control"; }
+  llvm::StringRef getArgument() const final {
+    return "add-scalar-pipe-control";
+  }
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createAddScalarPipeControlPass();

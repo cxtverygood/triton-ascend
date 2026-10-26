@@ -203,8 +203,9 @@ static LogicalResult guardMainLoopBody(Operation *loopOp) {
     resultTypes.push_back(value.getType());
   }
 
-  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, resultTypes, condition,
-                                             /*withElseRegion=*/!thenValues.empty());
+  scf::IfOp ifOp =
+      builder.create<scf::IfOp>(loc, resultTypes, condition,
+                                /*withElseRegion=*/!thenValues.empty());
 
   Region &thenRegion = ifOp.getThenRegion();
   if (thenRegion.empty()) {
