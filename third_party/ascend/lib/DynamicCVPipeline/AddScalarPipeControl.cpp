@@ -39,6 +39,7 @@
 #include "mlir/Support/LogicalResult.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 
 using namespace mlir;
@@ -53,6 +54,10 @@ static constexpr const char *DEBUG_TYPE = "AddScalarPipeControl";
 // Flag id reserved for the PIPE_S scalar synchronization. Kept in sync with
 // kPipeSFlagId in AddControlFlowCondition/UpdateLoopOps.cpp.
 static constexpr int kPipeSFlagId = 15;
+
+// Offset of the second counter observed by a CUBE side wait. A CUBE waits for
+// two VECTOR sub-blocks, which own the counters `flag_id` and `flag_id + 16`.
+static constexpr int kPipeSSecondCounterOffset = 16;
 
 // True if `op` synchronizes through PIPE_S on `flagId`, i.e. it is one of the
 // scalar pipe syncs emitted around a main loop.
@@ -92,8 +97,48 @@ static bool hasNestedMainLoop(Operation *op) {
   return nested;
 }
 
-// Guard the whole main loop body with a single `scf.if` on a constant `true`
-// condition.
+// Build the readiness condition of the guard.
+//
+// The condition queries the PIPE_S counters that the blocking
+// `sync_block_wait` inside the guard would consume, without consuming them:
+// `try_wait` only observes the hardware state. The blocking wait therefore
+// stays inside the guard and still consumes the token once the condition
+// holds.
+//
+// A VECTOR side wait observes a single counter. A CUBE side wait observes the
+// counters of the two VECTOR sub-blocks, i.e. `flag_id` and `flag_id + 16`, so
+// both of them have to be queried.
+//
+// The queries are emitted before the guard, they must not be part of it:
+// otherwise the condition could never be evaluated.
+static Value buildReadinessCondition(OpBuilder &builder, Location loc,
+                                     Operation *waitOp) {
+  auto wait = cast<SyncBlockWaitOp>(waitOp);
+
+  SmallVector<int> flagIds = {kPipeSFlagId};
+  if (wait.getTcoreTypeAttr().getTcoretype() == TCoreType::CUBE) {
+    flagIds.push_back(kPipeSFlagId + kPipeSSecondCounterOffset);
+  }
+
+  Value ready;
+  for (int flagId : flagIds) {
+    auto flagAttr = builder.getIntegerAttr(builder.getI64Type(), flagId);
+    auto tryWait =
+        builder.create<TryWaitOp>(loc, flagAttr, TryWaitSyncMode::INTRA_BLOCK);
+    Value zero = builder.create<arith::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(0));
+    // The counter holds the number of pending tokens, a non-zero value means
+    // the peer already signalled.
+    Value isReady = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                                  tryWait.getCounter(), zero);
+    ready =
+        ready ? builder.create<arith::AndIOp>(loc, ready, isReady) : isReady;
+  }
+  return ready;
+}
+
+// Guard the whole main loop body with a single `scf.if` on the readiness
+// condition of the PIPE_S synchronization.
 //
 // The guarded region spans from the PIPE_S wait at the head of the body up to
 // the matching PIPE_S set right before the terminator, so every op in between
@@ -195,8 +240,7 @@ static LogicalResult guardMainLoopBody(Operation *loopOp) {
   OpBuilder builder(waitOp);
   Location loc = waitOp->getLoc();
 
-  Value condition = builder.create<arith::ConstantOp>(
-      loc, builder.getI1Type(), builder.getBoolAttr(true));
+  Value condition = buildReadinessCondition(builder, loc, waitOp);
 
   SmallVector<Type> resultTypes;
   for (Value value : thenValues) {
@@ -248,6 +292,14 @@ void AddScalarPipeControlPass::runOnOperation() {
   ModuleOp module = getOperation();
 
   if (CVPipeline::hasFallbackAttr(module)) {
+    return;
+  }
+
+  // The guard condition is built on `try_wait`, which is only available on the
+  // register based architectures. On the memory based ones (A3) the LLVM
+  // export rejects the op, so the main loop is left untouched there.
+  if (hacc::utils::isMemBasedArch(module)) {
+    LOG_DEBUG("mem-based arch, try_wait is unsupported: keep main loop as is");
     return;
   }
 

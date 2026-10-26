@@ -3,7 +3,12 @@
 // Negative cases for AddScalarPipeControl: the pass must leave the IR
 // untouched whenever it cannot build a correct guard. It never fails the
 // pass and never produces a half-guarded loop.
+//
+// The module targets an A5 device: `try_wait` is only available on the
+// register based architectures, so on the memory based ones the pass would
+// bail out early and these cases would pass for the wrong reason.
 
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 func.func @escape_value() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -22,11 +27,13 @@ func.func @escape_value() {
 // break that use, so the pass gives up and leaves the loop alone.
 // CHECK-LABEL: func.func @escape_value
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: arith.addi
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: arith.muli
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @missing_set() {
   %c0 = arith.constant 0 : index
@@ -41,8 +48,10 @@ func.func @missing_set() {
 // A PIPE_S wait without a matching PIPE_S set is not a complete pair.
 // CHECK-LABEL: func.func @missing_set
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @other_flag() {
   %c0 = arith.constant 0 : index
@@ -59,9 +68,11 @@ func.func @other_flag() {
 // alone.
 // CHECK-LABEL: func.func @other_flag
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 2
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 2
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @other_pipe() {
   %c0 = arith.constant 0 : index
@@ -77,9 +88,11 @@ func.func @other_pipe() {
 // Only PIPE_S on both sides is the scalar sync, other pipes are left alone.
 // CHECK-LABEL: func.func @other_pipe
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_V>, <PIPE_V>] flag = 15
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_V>, <PIPE_V>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @missing_wait() {
   %c0 = arith.constant 0 : index
@@ -94,8 +107,10 @@ func.func @missing_wait() {
 // A PIPE_S set without a matching PIPE_S wait is not a complete pair.
 // CHECK-LABEL: func.func @missing_wait
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @set_before_wait() {
   %c0 = arith.constant 0 : index
@@ -111,9 +126,11 @@ func.func @set_before_wait() {
 // The set comes before the wait, so the wait has no set to close it.
 // CHECK-LABEL: func.func @set_before_wait
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @not_main_loop() {
   %c0 = arith.constant 0 : index
@@ -129,9 +146,11 @@ func.func @not_main_loop() {
 // Only a loop tagged as main_loop is guarded, a plain loop is left alone.
 // CHECK-LABEL: func.func @not_main_loop
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @sync_in_nested_region() {
   %c0 = arith.constant 0 : index
@@ -151,9 +170,11 @@ func.func @sync_in_nested_region() {
 // pair to guard.
 // CHECK-LABEL: func.func @sync_in_nested_region
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 
 func.func @escape_into_nested_region() {
   %c0 = arith.constant 0 : index
@@ -170,13 +191,16 @@ func.func @escape_into_nested_region() {
   } {ssbuffer.block_id = 29 : i32, ssbuffer.main_loop = 0 : i32}
   return
 }
+}
 
 // The value is used from a nested region that sits outside of the guarded
 // range, so it escapes.
 // CHECK-LABEL: func.func @escape_into_nested_region
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: arith.addi
 // CHECK: hivm.hir.sync_block_set[<VECTOR>, <PIPE_S>, <PIPE_S>] flag = 15
 // CHECK: arith.muli
 // CHECK-NOT: scf.if
+// CHECK-NOT: hivm.hir.try_wait

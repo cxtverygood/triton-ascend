@@ -76,7 +76,7 @@ def ComputeBlockOptPass : Pass<"compute-block-id-opt", "mlir::ModuleOp"> {
 def AddScalarPipeControlPass : Pass<"add-scalar-pipe-control", "mlir::ModuleOp"> {
   let summary = "Guard the PIPE_S syncs of a main loop body with scf.if";
   let constructor = "triton::createAddScalarPipeControlPass()";
-  let dependentDialects = ["scf::SCFDialect", "arith::ArithDialect"];
+  let dependentDialects = ["scf::SCFDialect", "arith::ArithDialect", "hivm::HIVMDialect"];
 }
 
 def RemoveSsbufAttrPass : Pass<"remove-ssbuf-attr", "mlir::ModuleOp"> {
