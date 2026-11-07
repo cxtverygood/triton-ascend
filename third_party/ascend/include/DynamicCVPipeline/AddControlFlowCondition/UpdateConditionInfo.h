@@ -142,8 +142,11 @@ private:
       SmallVector<Value> &conditions, SetVector<Value> &usedVarsSet,
       DenseMap<Value, VarUpdateType> &varUpdateTypes);
 
+  // `blockFlag` is the flag of the main loop the block belongs to. When it is
+  // not null the block gets an extra result holding the flag: the then block
+  // yields 1 (the block has run), the else block yields the flag it received.
   SmallVector<Type> buildNewIfResultTypes(scf::IfOp oldIfOp, bool hasCounter,
-                                          Value counter);
+                                          Value counter, Value blockFlag);
 
   void collectYieldOperands(Block &block, Operation *&yieldOp,
                             SmallVector<Value> &yieldOperands);
@@ -152,15 +155,18 @@ private:
                             Operation *oldThenYieldOp,
                             ArrayRef<Value> oldYieldOperands,
                             DenseMap<Value, VarUpdateType> &varUpdateTypes,
-                            bool hasCounter, Value counter, Value step);
+                            bool hasCounter, Value counter, Value step,
+                            Value blockFlag);
 
   void populateNewElseBlock(scf::IfOp newIfOp, scf::IfOp oldIfOp,
-                            bool oldHasElse, bool hasCounter, Value counter);
+                            bool oldHasElse, bool hasCounter, Value counter,
+                            Value blockFlag);
 
   scf::IfOp
   createNewIfOpWithBlocks(scf::IfOp oldIfOp, Value combinedCond,
                           DenseMap<Value, VarUpdateType> &varUpdateTypes,
-                          bool hasCounter, Value counter, Value step);
+                          bool hasCounter, Value counter, Value step,
+                          Value blockFlag);
 
   int setIntraCoreCondition(
       ModuleOp module, scf::IfOp ifOp,
@@ -182,12 +188,15 @@ private:
   int updateLoopYield(Operation *loopOp);
 
   // loopOp is scf.for or scf.while main_loop.
+  // `blockFlag` is the flag the block takes as an extra condition. On return
+  // it holds the flag the block yields, the flag of the next block.
   int combineConditions(ModuleOp module, Value crossCoreCond,
                         Value intraCoreCond, Value flowOptCond, scf::IfOp ifOp,
                         Operation *loopOp, size_t &usedCounterNum,
-                        DenseMap<Value, VarUpdateType> &varUpdateTypes);
+                        DenseMap<Value, VarUpdateType> &varUpdateTypes,
+                        Value &blockFlag);
 
-  int setCrossCoreCondition(scf::IfOp ifOp,
+  int setCrossCoreCondition(scf::IfOp ifOp, Operation *loopOp,
                             SmallVector<SmallVector<Value>> ssbufferPtrs,
                             Value &crossCoreCond);
 
@@ -240,13 +249,25 @@ private:
                               SmallVector<SmallVector<Value>> ssbufferPtrs,
                               DenseMap<Value, Value> &loadedCounters);
 
+  // Read the counter held by `memref`. The load is placed at the beginning of
+  // the main loop body, so that all the counter reads of a loop iteration are
+  // gathered in one place. `loadedCounters` caches the counters that were
+  // already loaded.
+  Value loadCounter(OpBuilder &builder, Location loc, Value memref,
+                    DenseMap<Value, Value> &loadedCounters);
+
+  // Body of the main loop: the counter loads are placed at its beginning.
+  // The body of an scf.for becomes the do region of the scf.while the main
+  // loop is turned into.
+  Block *getMainLoopBody(Operation *loopOp);
+
   // Bump the counter owned by `ifOp` in the then block. The value that the
   // conditions loaded is reused, the counter has a single writer.
   void updateBlockCounterVars(OpBuilder &builder, Location loc, scf::IfOp ifOp,
                               bool isAIC, Value oneConst,
                               DenseMap<int, Value> &vectorSSBufferMemrefs,
                               SmallVector<SmallVector<Value>> ssbufferPtrs,
-                              const DenseMap<Value, Value> &loadedCounters);
+                              DenseMap<Value, Value> &loadedCounters);
 
   DenseMap<Value, Value> controlVarToLatestValue;
   SmallVector<Value> currentUsedVars;
@@ -265,6 +286,14 @@ private:
   llvm::DenseMap<Operation *, DenseMap<int, Value>> vectorSSBufferMemrefCache;
   // sub_block_idx * VECTOR_SSBUF_OFFSET of every vector scope.
   llvm::DenseMap<Operation *, Value> vectorSubBlockOffsetCache;
+  // Body of the main loop the counter loads are placed in, and the last of
+  // the loads already created. They are reset for every main loop.
+  Block *counterLoadBlock = nullptr;
+  Operation *counterLoadTail = nullptr;
+  // Values of the counters already loaded in the current main loop, indexed by
+  // the address they were read from. The blocks of a loop share them, so that
+  // a counter is read once per iteration. It is reset for every main loop.
+  DenseMap<Value, Value> loadedCounters;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createUpdateConditionInfoPass();
