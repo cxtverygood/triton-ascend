@@ -17,7 +17,10 @@
 // CHECK: %[[SLT:.*]] = arith.cmpi slt, %{{.*}}, %[[LIM]] : i32
 // CHECK: %[[AND_P0:.*]] = arith.andi %{{.*}}, %[[SLT]]
 // CHECK: %[[COND5:.*]] = arith.andi %[[AND_P0]], %{{.*}}
-// CHECK: scf.if %[[COND5]]
+// The flag of the loop gates the block.
+// CHECK: %[[FLAGCMP5:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND5F:.*]] = arith.andi %[[COND5]], %[[FLAGCMP5]]
+// CHECK: scf.if %[[AND5F]]
 // CHECK: %[[ONE_P:.*]] = arith.constant 1 : i32
 // CHECK: %[[INC:.*]] = arith.addi %{{.*}}, %[[ONE_P]] : i32
 // CHECK: scf.yield %{{.*}}, %[[INC]]
@@ -26,7 +29,10 @@
 // Consumer if=7: uses producer if result (latest), sgt 0 then -1.
 // CHECK: %[[SGT:.*]] = arith.cmpi sgt, %{{.*}}, %{{.*}} : i32
 // CHECK: %[[COND7:.*]] = arith.andi %[[SGT]], %{{.*}}
-// CHECK: scf.if %[[COND7]]
+// The flag of the previous block gates this one.
+// CHECK: %[[FLAGCMP7:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND7F:.*]] = arith.andi %[[COND7]], %[[FLAGCMP7]]
+// CHECK: scf.if %[[AND7F]]
 // CHECK: %[[ONE_C:.*]] = arith.constant 1 : i32
 // CHECK: %[[DEC:.*]] = arith.subi %{{.*}}, %[[ONE_C]] : i32
 // CHECK: } {{.*}}ssbuffer.if = 7

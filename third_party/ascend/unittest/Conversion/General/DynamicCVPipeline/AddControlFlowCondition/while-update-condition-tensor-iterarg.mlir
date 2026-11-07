@@ -22,7 +22,10 @@
 // CHECK: arith.cmpi eq, %{{.*}}, %[[ONE]] : i32
 // CHECK: arith.andi
 // CHECK: %[[COND5:.*]] = arith.andi
-// CHECK: scf.if %[[COND5]]
+// The flag of the loop gates the block.
+// CHECK: %[[FLAGCMP5:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND5F:.*]] = arith.andi %[[COND5]], %[[FLAGCMP5]]
+// CHECK: scf.if %[[AND5F]]
 // CHECK: arith.subi
 // CHECK: } {{.*}}ssbuffer.if = 5
 
@@ -32,7 +35,10 @@
 // CHECK: arith.cmpi eq, %{{.*}}, %[[ZERO]] : i32
 // CHECK: arith.andi
 // CHECK: %[[COND6:.*]] = arith.andi
-// CHECK: scf.if %[[COND6]]
+// The flag of the previous block gates this one.
+// CHECK: %[[FLAGCMP6:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND6F:.*]] = arith.andi %[[COND6]], %[[FLAGCMP6]]
+// CHECK: scf.if %[[AND6F]]
 // CHECK: arith.addi
 // CHECK: } {{.*}}ssbuffer.if = 6
 

@@ -18,21 +18,35 @@
 
 // CHECK: scf.while
 
+// The flag of the loop is 0 at the beginning of an iteration.
+// CHECK: ^bb0
+// CHECK: %[[FLAG:.*]] = arith.constant 0 : i32
+
+// All the counter loads of the loop are gathered at the beginning of the do
+// region, in front of the compute blocks that read them. A counter is read
+// once per iteration, the blocks that need it share the value.
 // Vector if=5: consumes a cube block (c_cube - c_vec > 0) and produces to
 // another cube block (c_vec - c_cube < 1); both and-ed with the while counter.
 // CHECK: %[[LD_C5:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: annotation.mark %[[LD_C5]] {memref_ext.volatile}
 // CHECK: %[[LD_V5:.*]] = memref.load %[[MEM_V5:.*]][] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: annotation.mark %[[LD_V5]] {memref_ext.volatile}
+// The counter of the cube block is read once, both blocks use its value.
+// CHECK: %[[LD_C6:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_C6]] {memref_ext.volatile}
+// CHECK: %[[LD_V6:.*]] = memref.load %[[MEM_V6:.*]][] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_V6]] {memref_ext.volatile}
 // CHECK: %[[DIFF_IN5:.*]] = arith.subi %[[LD_C5]], %[[LD_V5]] : i32
 // CHECK: %[[SGT5:.*]] = arith.cmpi sgt, %[[DIFF_IN5]], %{{.*}} : i32
-// CHECK: %[[LD_C5B:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
-// CHECK: annotation.mark %[[LD_C5B]] {memref_ext.volatile}
-// CHECK: %[[DIFF_OUT5:.*]] = arith.subi %[[LD_V5]], %[[LD_C5B]] : i32
+// CHECK: %[[DIFF_OUT5:.*]] = arith.subi %[[LD_V5]], %[[LD_C6]] : i32
 // CHECK: %[[SLT5:.*]] = arith.cmpi slt, %[[DIFF_OUT5]], %{{.*}} : i32
 // CHECK: %[[CROSS5:.*]] = arith.andi %[[SGT5]], %[[SLT5]]
 // CHECK: %[[AND5:.*]] = arith.andi %[[CROSS5]], %{{.*}}
-// CHECK: scf.if %[[AND5]]
+// The flag of the loop gates the block: it only runs when no other block of
+// the iteration has run yet.
+// CHECK: %[[FLAGCMP5:.*]] = arith.cmpi eq, %[[FLAG]], %{{.*}} : i32
+// CHECK: %[[AND5F:.*]] = arith.andi %[[AND5]], %[[FLAGCMP5]]
+// CHECK: scf.if %[[AND5F]]
 // The block bumps only its own counter: the value it already read for the
 // conditions is reused, the counter is not loaded again.
 // CHECK: %[[ADD5:.*]] = arith.addi %[[LD_V5]], %{{.*}} : i32
@@ -40,34 +54,43 @@
 // CHECK: } {{.*}}ssbuffer.if = 5
 
 // Vector if=6: consumer-only (c_cube - c_vec > 0), and-ed with while counter.
-// CHECK: %[[LD_C6:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
-// CHECK: annotation.mark %[[LD_C6]] {memref_ext.volatile}
-// CHECK: %[[LD_V6:.*]] = memref.load %[[MEM_V6:.*]][] : memref<i32, #hivm.address_space<ssbuf>>
-// CHECK: annotation.mark %[[LD_V6]] {memref_ext.volatile}
 // CHECK: %[[DIFF_IN6:.*]] = arith.subi %[[LD_C6]], %[[LD_V6]] : i32
 // CHECK: %[[SGT6:.*]] = arith.cmpi sgt, %[[DIFF_IN6]], %{{.*}} : i32
 // CHECK: %[[AND6:.*]] = arith.andi %[[SGT6]], %{{.*}}
-// CHECK: scf.if %[[AND6]]
+// The flag of the previous block gates this one.
+// CHECK: %[[FLAGCMP6:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND6F:.*]] = arith.andi %[[AND6]], %[[FLAGCMP6]]
+// CHECK: scf.if %[[AND6F]]
 // CHECK: %[[ADD6:.*]] = arith.addi %[[LD_V6]], %{{.*}} : i32
 // CHECK: memref.store %[[ADD6]], %[[MEM_V6]][] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: } {{.*}}ssbuffer.if = 6
 
 // Cube if=0: producer of the vector block, so it waits until it is less than
 // N rounds ahead of the consumer. The two vector cores own separate counter
-// copies, so the cube compares against both of them.
+// copies, so the cube compares against both of them. A counter is read once
+// per iteration: the counter of the cube block 1 is read by the block 0 and
+// by the block 1 itself.
 // CHECK: %[[LD_OWN0:.*]] = memref.load %[[MEM_OWN0:.*]][] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: annotation.mark %[[LD_OWN0]] {memref_ext.volatile}
 // CHECK: %[[LD_V0:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: annotation.mark %[[LD_V0]] {memref_ext.volatile}
-// CHECK: %[[DIFF0:.*]] = arith.subi %[[LD_OWN0]], %[[LD_V0]] : i32
-// CHECK: %[[SLT0:.*]] = arith.cmpi slt, %[[DIFF0]], %{{.*}} : i32
 // CHECK: %[[LD_V1:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
 // CHECK: annotation.mark %[[LD_V1]] {memref_ext.volatile}
+// CHECK: %[[LD_OWN1:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_OWN1]] {memref_ext.volatile}
+// CHECK: %[[LD_V6C0:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_V6C0]] {memref_ext.volatile}
+// CHECK: %[[LD_V6C1:.*]] = memref.load %{{.*}}[] : memref<i32, #hivm.address_space<ssbuf>>
+// CHECK: annotation.mark %[[LD_V6C1]] {memref_ext.volatile}
+// CHECK: %[[DIFF0:.*]] = arith.subi %[[LD_OWN0]], %[[LD_V0]] : i32
+// CHECK: %[[SLT0:.*]] = arith.cmpi slt, %[[DIFF0]], %{{.*}} : i32
 // CHECK: %[[DIFF1:.*]] = arith.subi %[[LD_OWN0]], %[[LD_V1]] : i32
 // CHECK: %[[SLT1:.*]] = arith.cmpi slt, %[[DIFF1]], %{{.*}} : i32
 // CHECK: %[[CROSS0:.*]] = arith.andi %[[SLT0]], %[[SLT1]]
 // CHECK: %[[AND0:.*]] = arith.andi %[[CROSS0]], %{{.*}}
-// CHECK: scf.if %[[AND0]]
+// CHECK: %[[FLAGCMP0:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[AND0F:.*]] = arith.andi %[[AND0]], %[[FLAGCMP0]]
+// CHECK: scf.if %[[AND0F]]
 // The cube reuses the value of its own counter that it already read.
 // CHECK: %[[ADD0:.*]] = arith.addi %[[LD_OWN0]], %{{.*}} : i32
 // CHECK: memref.store %[[ADD0]], %[[MEM_OWN0]][] : memref<i32, #hivm.address_space<ssbuf>>

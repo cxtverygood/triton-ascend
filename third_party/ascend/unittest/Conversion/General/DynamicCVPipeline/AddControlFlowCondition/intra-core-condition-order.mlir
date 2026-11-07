@@ -11,11 +11,16 @@
 
 // CHECK-LABEL: func.func @intra_core_condition_order
 // CHECK: scf.while (%{{[^ ]+}} = %{{[^ ,]+}}, %[[CNT0:[^ ,]+]] = %{{[^ ,]+}}, %[[CNT1:[^ ,]+]] = %{{[^ ,]+}}, %[[CNT2:[^ ,]+]] = %{{[^ ,]+}}, %[[DEP0:[^ ,]+]] = %{{[^ ,]+}}, %[[DEP1:[^ ,]+]] = %{{[^ ,]+}})
+// CHECK: ^bb0
+// CHECK: %[[FLAG:.*]] = arith.constant 0 : i32
 // CHECK: arith.cmpi slt, %[[DEP0]], %{{.*}}
-// CHECK: %[[IF1:[0-9]+]]:2 = scf.if
+// CHECK: %[[FLAGCMP1:.*]] = arith.cmpi eq, %[[FLAG]], %{{.*}} : i32
+// CHECK: %[[AND1F:.*]] = arith.andi %{{.*}}, %[[FLAGCMP1]]
+// CHECK: %[[IF1:[0-9]+]]:3 = scf.if
 // CHECK: arith.addi %[[DEP0]], %{{.*}}
 // CHECK: arith.cmpi sgt, %[[IF1]]#0, %{{.*}}
 // CHECK: arith.cmpi slt, %[[DEP1]], %{{.*}}
+// CHECK: %[[FLAGCMP2:.*]] = arith.cmpi eq, %[[IF1]]#2, %{{.*}} : i32
 // CHECK: %[[DEC0:.*]] = arith.subi %[[IF1]]#0, %{{.*}}
 // CHECK: %[[INC1:.*]] = arith.addi %[[DEP1]], %{{.*}}
 // CHECK: scf.yield %[[DEC0]], %[[INC1]], %{{.*}}

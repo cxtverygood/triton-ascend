@@ -1058,18 +1058,6 @@ Value UpdateConditionInfoPass::addCrossCoreBlockConditions(
   }
 
   // Every counter is read once, the loaded value is shared by all conditions.
-  auto loadCounter = [&](Value memref) -> Value {
-    auto it = loadedCounters.find(memref);
-    if (it != loadedCounters.end()) {
-      return it->second;
-    }
-    auto loadOp = builder.create<memref::LoadOp>(loc, memref, ValueRange{});
-    auto markOp = builder.create<annotation::MarkOp>(loc, loadOp);
-    markOp->setAttr(kMemrefExtVolatile, builder.getUnitAttr());
-    loadedCounters[memref] = loadOp.getResult();
-    return loadOp.getResult();
-  };
-
   for (const CrossCoreBlockEdge &edge : edgesIt->second) {
     bool currentIsProducer = (edge.producer == ifOp);
     scf::IfOp producer = edge.producer;
@@ -1113,8 +1101,10 @@ Value UpdateConditionInfoPass::addCrossCoreBlockConditions(
     }
 
     for (const auto &pair : pairs) {
-      Value producerValue = loadCounter(pair.first);
-      Value consumerValue = loadCounter(pair.second);
+      Value producerValue =
+          loadCounter(builder, loc, pair.first, loadedCounters);
+      Value consumerValue =
+          loadCounter(builder, loc, pair.second, loadedCounters);
       Value diff =
           builder.create<arith::SubIOp>(loc, producerValue, consumerValue);
       if (currentIsProducer) {
@@ -1131,14 +1121,66 @@ Value UpdateConditionInfoPass::addCrossCoreBlockConditions(
     // A cube block reads the whole slot filled by the two vector cores: it
     // has to wait until both cores produced the same number of rounds.
     if (!currentIsProducer && isAIC && producerIsVector) {
-      Value core0Value = loadCounter(producerMemrefs[0]);
-      Value core1Value = loadCounter(producerMemrefs[1]);
+      Value core0Value =
+          loadCounter(builder, loc, producerMemrefs[0], loadedCounters);
+      Value core1Value =
+          loadCounter(builder, loc, producerMemrefs[1], loadedCounters);
       combineCondition(builder.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::eq, core0Value, core1Value));
     }
   }
 
   return conditions;
+}
+
+// Body of the main loop: the counter loads are placed at its beginning.
+// The body of an scf.for becomes the do region of the scf.while the main
+// loop is turned into, the order of its operations is kept.
+Block *UpdateConditionInfoPass::getMainLoopBody(Operation *loopOp) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
+    return forOp.getBody();
+  }
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp)) {
+    return whileOp.getAfterBody();
+  }
+  return nullptr;
+}
+
+// Read the counter held by `memref`.
+//
+// The load is not placed where the condition using it is built, but at the
+// beginning of the body of the main loop: every counter read of a loop
+// iteration is gathered there, in front of the compute blocks that use them.
+// The loads stay inside the loop, so every iteration reads the counters
+// again.
+//
+// `loadedCounters` maps the counter address to the value that was loaded
+// from it, a counter is only read once for the conditions of a block.
+Value UpdateConditionInfoPass::loadCounter(
+    OpBuilder &builder, Location loc, Value memref,
+    DenseMap<Value, Value> &loadedCounters) {
+  auto it = loadedCounters.find(memref);
+  if (it != loadedCounters.end()) {
+    return it->second;
+  }
+
+  OpBuilder loadBuilder(builder.getContext());
+  if (counterLoadTail) {
+    loadBuilder.setInsertionPointAfter(counterLoadTail);
+  } else if (counterLoadBlock) {
+    loadBuilder.setInsertionPointToStart(counterLoadBlock);
+  } else {
+    // No main loop body known, keep the load where it was asked for.
+    loadBuilder.setInsertionPoint(builder.getInsertionBlock(),
+                                  builder.getInsertionPoint());
+  }
+
+  auto loadOp = loadBuilder.create<memref::LoadOp>(loc, memref, ValueRange{});
+  auto markOp = loadBuilder.create<annotation::MarkOp>(loc, loadOp);
+  markOp->setAttr(kMemrefExtVolatile, loadBuilder.getUnitAttr());
+  counterLoadTail = markOp;
+  loadedCounters[memref] = loadOp.getResult();
+  return loadOp.getResult();
 }
 
 // Increment the counter owned by `ifOp` at the end of its then block.
@@ -1148,7 +1190,7 @@ void UpdateConditionInfoPass::updateBlockCounterVars(
     OpBuilder &builder, Location loc, scf::IfOp ifOp, bool isAIC,
     Value oneConst, DenseMap<int, Value> &vectorSSBufferMemrefs,
     SmallVector<SmallVector<Value>> ssbufferPtrs,
-    const DenseMap<Value, Value> &loadedCounters) {
+    DenseMap<Value, Value> &loadedCounters) {
   auto slotIt = info->blockCounterSlots.find(ifOp);
   if (slotIt == info->blockCounterSlots.end()) {
     return;
@@ -1183,11 +1225,7 @@ void UpdateConditionInfoPass::updateBlockCounterVars(
     currentValue = loadedIt->second;
   } else {
     // The conditions of this block did not read its counter, load it.
-    auto loadOp =
-        builder.create<memref::LoadOp>(loc, counterMemref, ValueRange{});
-    auto markOp = builder.create<annotation::MarkOp>(loc, loadOp);
-    markOp->setAttr(kMemrefExtVolatile, builder.getUnitAttr());
-    currentValue = loadOp.getResult();
+    currentValue = loadCounter(builder, loc, counterMemref, loadedCounters);
   }
   Value newValue = builder.create<arith::AddIOp>(loc, currentValue, oneConst);
   builder.create<memref::StoreOp>(loc, newValue, counterMemref, ValueRange{});
@@ -1195,11 +1233,17 @@ void UpdateConditionInfoPass::updateBlockCounterVars(
 
 // Set the crossCore condition of `ifOp` and bump its own counter.
 int UpdateConditionInfoPass::setCrossCoreCondition(
-    scf::IfOp ifOp, SmallVector<SmallVector<Value>> ssbufferPtrs,
-    Value &crossCoreCond) {
+    scf::IfOp ifOp, Operation *loopOp,
+    SmallVector<SmallVector<Value>> ssbufferPtrs, Value &crossCoreCond) {
   OpBuilder builder(ifOp);
   Location loc = ifOp.getLoc();
   crossCoreCond = nullptr;
+
+  // The counter loads are gathered at the beginning of the body of the main
+  // loop, in front of the compute blocks that read them.
+  if (!counterLoadBlock) {
+    counterLoadBlock = getMainLoopBody(loopOp);
+  }
 
   // Only the blocks taking part in a cross-core dependency own a counter.
   if (!info->blockCounterSlots.count(ifOp)) {
@@ -1255,8 +1299,9 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
 
   // ========== Part 2: Add cross-core conditions ==========
   // The counters that are read by the conditions are kept, the update of the
-  // counter of this block reuses the value that was loaded here.
-  DenseMap<Value, Value> loadedCounters;
+  // counter of this block reuses the value that was loaded here. The cache is
+  // shared by all the blocks of the loop: a counter is read once per
+  // iteration, every block that needs it reuses that value.
   crossCoreCond = addCrossCoreBlockConditions(builder, loc, ifOp, isAIC,
                                               zeroConst, vectorSSBufferMemrefs,
                                               ssbufferPtrs, loadedCounters);
@@ -1892,9 +1937,8 @@ int UpdateConditionInfoPass::validateBlockCounters(Operation *loopOp,
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
 
-SmallVector<Type>
-UpdateConditionInfoPass::buildNewIfResultTypes(scf::IfOp oldIfOp,
-                                               bool hasCounter, Value counter) {
+SmallVector<Type> UpdateConditionInfoPass::buildNewIfResultTypes(
+    scf::IfOp oldIfOp, bool hasCounter, Value counter, Value blockFlag) {
   SmallVector<Type> resultTypes;
   for (Value result : oldIfOp.getResults()) {
     resultTypes.push_back(result.getType());
@@ -1905,9 +1949,14 @@ UpdateConditionInfoPass::buildNewIfResultTypes(scf::IfOp oldIfOp,
   if (hasCounter) {
     resultTypes.push_back(counter.getType());
   }
+  if (blockFlag) {
+    resultTypes.push_back(
+        IntegerType::get(oldIfOp.getContext(), CONST_INT_TYPE));
+  }
   LDBG("Build new if result types: old results "
        << oldIfOp.getNumResults() << ", control vars " << currentUsedVars.size()
-       << ", has counter " << hasCounter << "." << "\n");
+       << ", has counter " << hasCounter << ", has flag " << (bool)blockFlag
+       << "." << "\n");
   return resultTypes;
 }
 
@@ -1937,7 +1986,7 @@ void UpdateConditionInfoPass::populateNewThenBlock(
     scf::IfOp newIfOp, Block &oldThenBlock, Operation *oldThenYieldOp,
     ArrayRef<Value> oldYieldOperands,
     DenseMap<Value, VarUpdateType> &varUpdateTypes, bool hasCounter,
-    Value counter, Value step) {
+    Value counter, Value step, Value blockFlag) {
   Location loc = newIfOp.getLoc();
   Block &newThenBlock = newIfOp.getThenRegion().front();
   for (Operation &op : llvm::make_early_inc_range(oldThenBlock)) {
@@ -1980,16 +2029,22 @@ void UpdateConditionInfoPass::populateNewThenBlock(
     LDBG("Append updated counter to then yield." << "\n");
   }
 
+  if (blockFlag) {
+    // The block has run, the flag of the loop becomes 1.
+    Value one =
+        thenBuilder.create<arith::ConstantIntOp>(loc, 1, CONST_INT_TYPE);
+    thenYieldOperands.push_back(one);
+    LDBG("Append the flag of the block to then yield." << "\n");
+  }
+
   LDBG("Create then yield with " << thenYieldOperands.size() << " operands."
                                  << "\n");
   thenBuilder.create<scf::YieldOp>(loc, thenYieldOperands);
 }
 
-void UpdateConditionInfoPass::populateNewElseBlock(scf::IfOp newIfOp,
-                                                   scf::IfOp oldIfOp,
-                                                   bool oldHasElse,
-                                                   bool hasCounter,
-                                                   Value counter) {
+void UpdateConditionInfoPass::populateNewElseBlock(
+    scf::IfOp newIfOp, scf::IfOp oldIfOp, bool oldHasElse, bool hasCounter,
+    Value counter, Value blockFlag) {
   Location loc = newIfOp.getLoc();
   Block &newElseBlock = newIfOp.getElseRegion().front();
   SmallVector<Value> oldElseYieldOperands;
@@ -2036,6 +2091,12 @@ void UpdateConditionInfoPass::populateNewElseBlock(scf::IfOp newIfOp,
     elseYieldOperands.push_back(counterToUse);
   }
 
+  if (blockFlag) {
+    // The block did not run, the flag of the loop is passed on unchanged.
+    elseYieldOperands.push_back(blockFlag);
+    LDBG("Append the flag of the block to else yield." << "\n");
+  }
+
   LDBG("Create else yield with " << elseYieldOperands.size() << " operands."
                                  << "\n");
   elseBuilder.create<scf::YieldOp>(loc, elseYieldOperands);
@@ -2048,11 +2109,11 @@ void UpdateConditionInfoPass::populateNewElseBlock(scf::IfOp newIfOp,
 scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
     scf::IfOp oldIfOp, Value combinedCond,
     DenseMap<Value, VarUpdateType> &varUpdateTypes, bool hasCounter,
-    Value counter, Value step) {
+    Value counter, Value step, Value blockFlag) {
   Location loc = oldIfOp.getLoc();
   OpBuilder builder(oldIfOp);
 
-  bool needsYield = !currentUsedVars.empty() || hasCounter;
+  bool needsYield = !currentUsedVars.empty() || hasCounter || (bool)blockFlag;
   bool oldHasElse = oldIfOp.getElseRegion().hasOneBlock();
   // Only create else when we will populate it;
   bool withElse = needsYield || oldHasElse;
@@ -2066,7 +2127,7 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
   SmallVector<Value> oldYieldOperands;
   collectYieldOperands(oldThenBlock, oldThenYieldOp, oldYieldOperands);
   SmallVector<Type> resultTypes =
-      buildNewIfResultTypes(oldIfOp, hasCounter, counter);
+      buildNewIfResultTypes(oldIfOp, hasCounter, counter, blockFlag);
   scf::IfOp newIfOp =
       builder.create<scf::IfOp>(loc, resultTypes, combinedCond, withElse);
   LDBG("Created replacement if op with " << resultTypes.size() << " results."
@@ -2077,9 +2138,10 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
   }
 
   populateNewThenBlock(newIfOp, oldThenBlock, oldThenYieldOp, oldYieldOperands,
-                       varUpdateTypes, hasCounter, counter, step);
+                       varUpdateTypes, hasCounter, counter, step, blockFlag);
   if (withElse) {
-    populateNewElseBlock(newIfOp, oldIfOp, oldHasElse, hasCounter, counter);
+    populateNewElseBlock(newIfOp, oldIfOp, oldHasElse, hasCounter, counter,
+                         blockFlag);
   }
 
   for (size_t i = 0; i < oldIfOp.getNumResults(); ++i) {
@@ -2091,11 +2153,12 @@ scf::IfOp UpdateConditionInfoPass::createNewIfOpWithBlocks(
 }
 
 // Combine the conditions: crossCore condition + intraCore condition + counter
-// condition + flowOpt condition
+// condition + flowOpt condition + the flag of the loop
 int UpdateConditionInfoPass::combineConditions(
     ModuleOp module, Value crossCoreCond, Value intraCoreCond,
     Value flowOptCond, scf::IfOp ifOp, Operation *loopOp,
-    size_t &usedCounterNum, DenseMap<Value, VarUpdateType> &varUpdateTypes) {
+    size_t &usedCounterNum, DenseMap<Value, VarUpdateType> &varUpdateTypes,
+    Value &blockFlag) {
   Location loc = ifOp.getLoc();
   SmallVector<Value> validConditions;
   Value counter;
@@ -2192,9 +2255,25 @@ int UpdateConditionInfoPass::combineConditions(
         builder.create<arith::AndIOp>(loc, combinedCond, validConditions[i]);
   }
 
+  // The flag of the loop is the last condition: the block only runs when no
+  // other block of the iteration has run yet.
+  if (blockFlag) {
+    Value zero = builder.create<arith::ConstantIntOp>(loc, 0, CONST_INT_TYPE);
+    Value flagCond = builder.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, blockFlag, zero);
+    combinedCond = builder.create<arith::AndIOp>(loc, combinedCond, flagCond);
+    LDBG("Add the flag condition of the loop." << "\n");
+  }
+
   Value step = updateCounterArg ? forOp.getStep() : Value();
-  scf::IfOp newIfOp = createNewIfOpWithBlocks(
-      ifOp, combinedCond, varUpdateTypes, updateCounterArg, counter, step);
+  scf::IfOp newIfOp =
+      createNewIfOpWithBlocks(ifOp, combinedCond, varUpdateTypes,
+                              updateCounterArg, counter, step, blockFlag);
+
+  if (blockFlag) {
+    // The flag of the next block is the one this block yields.
+    blockFlag = newIfOp.getResult(newIfOp.getNumResults() - 1);
+  }
 
   // Update DAG nodes
   updateDAGAfterIfOpReplacement(ifOp, newIfOp);
@@ -2265,6 +2344,30 @@ int UpdateConditionInfoPass::updateIfConds(
   for (Operation *loopOp : mainLoopOps) {
     controlVarToLatestValue.clear();
 
+    // The counter loads of this loop are gathered at the beginning of its
+    // body. The main loop is an scf.for here, it is turned into an scf.while
+    // later on, keeping the order of the body.
+    counterLoadBlock = getMainLoopBody(loopOp);
+    counterLoadTail = nullptr;
+    // The counters read by the blocks of this loop are read once, the blocks
+    // share the values.
+    loadedCounters.clear();
+
+    // The flag of the loop. It is 0 at the beginning of an iteration and
+    // becomes 1 as soon as a compute block has run. Every compute block takes
+    // it as an extra condition (flag == 0), so that at most one block runs per
+    // iteration. The block that ran yields 1, a block that did not run yields
+    // the flag it received, the next block may then run.
+    Value blockFlag;
+    if (counterLoadBlock) {
+      OpBuilder flagBuilder(counterLoadBlock, counterLoadBlock->begin());
+      auto flagOp = flagBuilder.create<arith::ConstantIntOp>(loopOp->getLoc(),
+                                                             0, CONST_INT_TYPE);
+      blockFlag = flagOp.getResult();
+      // The counter loads are placed after the flag.
+      counterLoadTail = flagOp.getOperation();
+    }
+
     // Step1: Get intraCoreBuffers from pre-collected map
     DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
         intraCoreBuffers;
@@ -2313,7 +2416,8 @@ int UpdateConditionInfoPass::updateIfConds(
 
       // Step3:Set the crossCore condition
       Value crossCoreCond;
-      if (setCrossCoreCondition(ifOp, ssbufferPtrs, crossCoreCond) != 0) {
+      if (setCrossCoreCondition(ifOp, loopOp, ssbufferPtrs, crossCoreCond) !=
+          0) {
         LDBG("setCrossCoreCondition failed! ifOp=" << ifOp << ", loopOp="
                                                    << *loopOp << "\n");
         return UPDATE_CONDITION_INFO_FAILED;
@@ -2334,10 +2438,10 @@ int UpdateConditionInfoPass::updateIfConds(
         return UPDATE_CONDITION_INFO_FAILED;
       }
       // Step6:Combine the conditions: crossCore + intraCore + counter +
-      // flowOpt
+      // flowOpt + the flag of the loop
       if (combineConditions(module, crossCoreCond, intraCoreCond, flowOptCond,
-                            ifOp, loopOp, usedCounterNum,
-                            varUpdateTypes) == UPDATE_CONDITION_INFO_FAILED) {
+                            ifOp, loopOp, usedCounterNum, varUpdateTypes,
+                            blockFlag) == UPDATE_CONDITION_INFO_FAILED) {
         return UPDATE_CONDITION_INFO_FAILED;
       }
     }

@@ -28,14 +28,18 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
       %30:2 = scf.for %arg16 = %c0_i32 to %c8192_i32 step %c128_i32 iter_args(%arg17 = %c0_i32, %arg18 = %c0_i32) -> (i32, i32)  : i32 {
         // Vector block 5 consumes the groups produced by cube block 0 and cube
         // block 2, and produces the group consumed by cube block 1.
+        // The counter loads of the loop are gathered at the beginning of the
+        // body of the main loop, in front of the blocks that read them. A
+        // counter is read once per iteration, the blocks share the value.
         // CHECK:       %[[C0:.+]] = memref.load
         // CHECK:       %[[V5:.+]] = memref.load
+        // CHECK:       %[[C2:.+]] = memref.load
+        // CHECK:       %[[C1:.+]] = memref.load
+        // CHECK:       %[[V6:.+]] = memref.load
         // CHECK:       %[[D0:.+]] = arith.subi %[[C0]], %[[V5]]
         // CHECK:       arith.cmpi sgt, %[[D0]]
-        // CHECK:       %[[C2:.+]] = memref.load
         // CHECK:       %[[D1:.+]] = arith.subi %[[C2]], %[[V5]]
         // CHECK:       arith.cmpi sgt, %[[D1]]
-        // CHECK:       %[[C1:.+]] = memref.load
         // CHECK:       %[[D2:.+]] = arith.subi %[[V5]], %[[C1]]
         // CHECK:       arith.constant 2 : i32
         // CHECK:       arith.cmpi slt, %[[D2]]
@@ -56,9 +60,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 
         // This block only contain an input
         // Vector block 6 consumes the group produced by cube block 1.
-        // CHECK:       %[[C1V:.+]] = memref.load
-        // CHECK:       %[[V6:.+]] = memref.load
-        // CHECK:       %[[DV:.+]] = arith.subi %[[C1V]], %[[V6]]
+        // CHECK:       %[[DV:.+]] = arith.subi %[[C1]], %[[V6]]
         // CHECK:       arith.cmpi sgt, %[[DV]]
         // CHECK:       scf.if
         hivm.hir.sync_block_set {ssbuffer.block_id = 6 : i32, ssbuffer.transfer_id = 3 : i32}[<VECTOR>, <PIPE_V>, <PIPE_FIX>] flag = 4
@@ -90,11 +92,18 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // Cube block 0 produces the group consumed by vector block 5. The
         // producer side condition is (c_cube0 - c_v5) < buffer_number, one
         // condition per vector core of the consumer block.
+        // A counter is read once per iteration: the counter of the vector
+        // block 5 is read by the cube blocks 0, 2 and 1, the counter of the
+        // vector block 6 by the cube block 1.
         // CHECK:       %[[CB0:.+]] = memref.load
         // CHECK:       %[[V5C0:.+]] = memref.load
+        // CHECK:       %[[V5C1:.+]] = memref.load
+        // CHECK:       %[[CB2:.+]] = memref.load
+        // CHECK:       %[[CB1:.+]] = memref.load
+        // CHECK:       %[[V6C0:.+]] = memref.load
+        // CHECK:       %[[V6C1:.+]] = memref.load
         // CHECK:       %[[P0:.+]] = arith.subi %[[CB0]], %[[V5C0]]
         // CHECK:       arith.cmpi slt, %[[P0]]
-        // CHECK:       %[[V5C1:.+]] = memref.load
         // CHECK:       %[[P1:.+]] = arith.subi %[[CB0]], %[[V5C1]]
         // CHECK:       arith.cmpi slt, %[[P1]]
         // CHECK:       scf.if
@@ -108,12 +117,9 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // CHECK:       } {hivm.matmul_limited_in_cube, ssbuffer.if = 0 : i32}
 
         // Cube block 2 produces the group consumed by vector block 5.
-        // CHECK:       %[[CB2:.+]] = memref.load
-        // CHECK:       %[[V5D0:.+]] = memref.load
-        // CHECK:       %[[P2:.+]] = arith.subi %[[CB2]], %[[V5D0]]
+        // CHECK:       %[[P2:.+]] = arith.subi %[[CB2]], %[[V5C0]]
         // CHECK:       arith.cmpi slt, %[[P2]]
-        // CHECK:       %[[V5D1:.+]] = memref.load
-        // CHECK:       %[[P3:.+]] = arith.subi %[[CB2]], %[[V5D1]]
+        // CHECK:       %[[P3:.+]] = arith.subi %[[CB2]], %[[V5C1]]
         // CHECK:       arith.cmpi slt, %[[P3]]
         // CHECK:       scf.if
         hivm.hir.sync_block_wait {ssbuffer.block_id = 2 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 2
@@ -128,21 +134,16 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // This block contain an input and a output
         // Cube block 1 produces the group consumed by vector block 6 and
         // consumes the group produced by vector block 5.
-        // CHECK:       %[[CB1:.+]] = memref.load
-        // CHECK:       %[[V6C0:.+]] = memref.load
         // CHECK:       %[[P4:.+]] = arith.subi %[[CB1]], %[[V6C0]]
         // CHECK:       arith.cmpi slt, %[[P4]]
-        // CHECK:       %[[V6C1:.+]] = memref.load
         // CHECK:       %[[P5:.+]] = arith.subi %[[CB1]], %[[V6C1]]
         // CHECK:       arith.cmpi slt, %[[P5]]
-        // CHECK:       %[[V5E0:.+]] = memref.load
-        // CHECK:       %[[C4:.+]] = arith.subi %[[V5E0]], %[[CB1]]
+        // CHECK:       %[[C4:.+]] = arith.subi %[[V5C0]], %[[CB1]]
         // CHECK:       arith.cmpi sgt, %[[C4]]
-        // CHECK:       %[[V5E1:.+]] = memref.load
-        // CHECK:       %[[C5:.+]] = arith.subi %[[V5E1]], %[[CB1]]
+        // CHECK:       %[[C5:.+]] = arith.subi %[[V5C1]], %[[CB1]]
         // CHECK:       arith.cmpi sgt, %[[C5]]
         // The two vector cores of the producer block must be aligned.
-        // CHECK:       arith.cmpi eq, %[[V5E0]], %[[V5E1]]
+        // CHECK:       arith.cmpi eq, %[[V5C0]], %[[V5C1]]
         // CHECK:       arith.andi
         // CHECK:       arith.cmpi sge
         // CHECK:       arith.cmpi sge
