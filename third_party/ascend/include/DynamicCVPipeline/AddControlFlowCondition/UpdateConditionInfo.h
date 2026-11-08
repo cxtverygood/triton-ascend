@@ -228,6 +228,10 @@ private:
   // counter slot. Fills info->blockCounterSlots and blockCounterOwners.
   int assignBlockCounterSlots(ModuleOp module);
 
+  // Find, for every computation block, the closest block of the same core
+  // that depends on it. Fills info->leadPartners.
+  int collectLeadPartners(ModuleOp module);
+
   // Memrefs holding the counter of `targetBlock` as seen by the reading core.
   //   cube reader  : vector target -> {core0 copy, core1 copy};
   //                  cube target   -> {the single copy}.
@@ -255,6 +259,20 @@ private:
   // already loaded.
   Value loadCounter(OpBuilder &builder, Location loc, Value memref,
                     DenseMap<Value, Value> &loadedCounters);
+
+  // Lead condition of `ifOp`: the block must not run more than
+  // `leadBufferCount` rounds ahead of its lead partner, the closest block of
+  // the same core that depends on it.
+  //
+  //   c_ifOp - c_partner <= leadBufferCount
+  Value
+  addLeadCondition(OpBuilder &builder, Location loc, scf::IfOp ifOp, bool isAIC,
+                   DenseMap<int, Value> &vectorSSBufferMemrefs,
+                   SmallVector<SmallVector<Value>> ssbufferPtrs,
+                   DenseMap<Value, Value> &loadedCounters);
+
+  // The number of the cross-core buffers, the bound of the lead condition.
+  int getLeadBufferCount(ModuleOp module);
 
   // Body of the main loop: the counter loads are placed at its beginning.
   // The body of an scf.for becomes the do region of the scf.while the main
@@ -294,6 +312,8 @@ private:
   // the address they were read from. The blocks of a loop share them, so that
   // a counter is read once per iteration. It is reset for every main loop.
   DenseMap<Value, Value> loadedCounters;
+  // The number of the cross-core buffers, the bound of the lead condition.
+  int leadBufferCount = 2;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createUpdateConditionInfoPass();

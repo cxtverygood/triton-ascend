@@ -43,6 +43,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // CHECK:       %[[D2:.+]] = arith.subi %[[V5]], %[[C1]]
         // CHECK:       arith.constant 2 : i32
         // CHECK:       arith.cmpi slt, %[[D2]]
+        // The lead condition of the vector block 5: the vector block 6 is the
+        // closest vector block that depends on it, so the block must not run
+        // more than the number of the cross-core buffers ahead of it.
+        // CHECK:       %[[DL:.+]] = arith.subi %[[V5]], %[[V6]]
+        // CHECK:       arith.cmpi sle, %[[DL]]
         // CHECK:       scf.if
         hivm.hir.sync_block_set {ssbuffer.block_id = 5 : i32, ssbuffer.transfer_id = 3 : i32}[<VECTOR>, <PIPE_V>, <PIPE_FIX>] flag = 4
         %memspacecast_11 = memref.memory_space_cast %alloc_5 {ssbuffer.block_id = 5 : i32, ssbuffer.transfer_id = 1 : i32, ssbuffer.crossCoreDeps = [0 : i32, 0 : i32]} : memref<128x128xf32, #hivm.address_space<ub>> to memref<128x128xf32>
@@ -94,18 +99,23 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // condition per vector core of the consumer block.
         // A counter is read once per iteration: the counter of the vector
         // block 5 is read by the cube blocks 0, 2 and 1, the counter of the
-        // vector block 6 by the cube block 1.
+        // vector block 6 by the cube block 1. The counter of the cube block 1
+        // is read by the cube blocks 0 and 2, which lead over it.
         // CHECK:       %[[CB0:.+]] = memref.load
         // CHECK:       %[[V5C0:.+]] = memref.load
         // CHECK:       %[[V5C1:.+]] = memref.load
-        // CHECK:       %[[CB2:.+]] = memref.load
         // CHECK:       %[[CB1:.+]] = memref.load
+        // CHECK:       %[[CB2:.+]] = memref.load
         // CHECK:       %[[V6C0:.+]] = memref.load
         // CHECK:       %[[V6C1:.+]] = memref.load
         // CHECK:       %[[P0:.+]] = arith.subi %[[CB0]], %[[V5C0]]
         // CHECK:       arith.cmpi slt, %[[P0]]
         // CHECK:       %[[P1:.+]] = arith.subi %[[CB0]], %[[V5C1]]
         // CHECK:       arith.cmpi slt, %[[P1]]
+        // The lead condition of the cube block 0: the cube block 1 is the
+        // closest cube block that depends on it.
+        // CHECK:       %[[PL0:.+]] = arith.subi %[[CB0]], %[[CB1]]
+        // CHECK:       arith.cmpi sle, %[[PL0]]
         // CHECK:       scf.if
         hivm.hir.sync_block_wait {ssbuffer.block_id = 0 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 2
         %30 = tensor.empty() {ssbuffer.block_id = 0 : i32} : tensor<128x128xf32>
@@ -121,6 +131,10 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
         // CHECK:       arith.cmpi slt, %[[P2]]
         // CHECK:       %[[P3:.+]] = arith.subi %[[CB2]], %[[V5C1]]
         // CHECK:       arith.cmpi slt, %[[P3]]
+        // The lead condition of the cube block 2: the cube block 1 is the
+        // closest cube block that depends on it.
+        // CHECK:       %[[PL2:.+]] = arith.subi %[[CB2]], %[[CB1]]
+        // CHECK:       arith.cmpi sle, %[[PL2]]
         // CHECK:       scf.if
         hivm.hir.sync_block_wait {ssbuffer.block_id = 2 : i32, ssbuffer.transfer_id = 1 : i32}[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 2
         %31 = tensor.empty() {ssbuffer.block_id = 2 : i32} : tensor<128x128xf32>

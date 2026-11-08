@@ -128,6 +128,11 @@ struct ControlFlowConditionInfo {
   // the value holds every edge the block takes part in, in both directions.
   llvm::DenseMap<scf::IfOp, llvm::SmallVector<CrossCoreBlockEdge>>
       crossCoreBlockEdges;
+  // Lead partner of a computation block: the closest block of the same core
+  // that depends on it. A block must not run too far ahead of its partner,
+  // the difference of the two block counters is bounded by the number of the
+  // cross-core buffers.
+  llvm::DenseMap<scf::IfOp, scf::IfOp> leadPartners;
 
   // Buffer counts for flowOpt condition
   int intraCoreBufferCount = 0;

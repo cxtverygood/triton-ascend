@@ -472,6 +472,93 @@ int UpdateConditionInfoPass::assignBlockCounterSlots(ModuleOp module) {
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
 
+// Find, for every computation block, the closest block of the same core that
+// depends on it. That block is the lead partner of the block: the block must
+// not run too far ahead of it, the difference of the two block counters is
+// bounded by the number of the cross-core buffers.
+//
+// The partners are searched in the cross-core block edges: the successors of a
+// block are the blocks consuming what it produces. The search is done level by
+// level, so the closest block of the same core wins; the smallest block id
+// breaks the tie.
+int UpdateConditionInfoPass::collectLeadPartners(ModuleOp module) {
+  info->leadPartners.clear();
+
+  // The successors of a block: the blocks consuming what it produces.
+  llvm::DenseMap<scf::IfOp, SmallVector<scf::IfOp>> successors;
+  for (auto &entry : info->crossCoreBlockEdges) {
+    for (const CrossCoreBlockEdge &edge : entry.second) {
+      if (edge.producer != entry.first) {
+        // The edge is stored in both directions, only keep the producer side.
+        continue;
+      }
+      successors[edge.producer].push_back(edge.consumer);
+    }
+  }
+
+  auto blockIdOf = [](scf::IfOp ifOp) {
+    int blockId = -1;
+    getIfBlockId(ifOp, blockId);
+    return blockId;
+  };
+  auto byBlockId = [&](scf::IfOp a, scf::IfOp b) {
+    return blockIdOf(a) < blockIdOf(b);
+  };
+
+  for (auto &entry : info->blockCounterSlots) {
+    scf::IfOp block = entry.first;
+    bool blockIsVector = entry.second.isVector;
+
+    llvm::DenseSet<scf::IfOp> visited;
+    visited.insert(block);
+    SmallVector<scf::IfOp> frontier;
+    frontier.push_back(block);
+    scf::IfOp partner = nullptr;
+
+    while (!frontier.empty() && !partner) {
+      SmallVector<scf::IfOp> nextFrontier;
+      for (scf::IfOp node : frontier) {
+        auto it = successors.find(node);
+        if (it == successors.end()) {
+          continue;
+        }
+        SmallVector<scf::IfOp> blockSuccessors = it->second;
+        llvm::sort(blockSuccessors, byBlockId);
+        for (scf::IfOp succ : blockSuccessors) {
+          if (!visited.insert(succ).second) {
+            continue;
+          }
+          nextFrontier.push_back(succ);
+        }
+      }
+
+      // The closest block of the same core wins, the smallest block id breaks
+      // the tie.
+      for (scf::IfOp succ : nextFrontier) {
+        auto slotIt = info->blockCounterSlots.find(succ);
+        if (slotIt == info->blockCounterSlots.end()) {
+          continue;
+        }
+        if (slotIt->second.isVector != blockIsVector) {
+          continue;
+        }
+        if (!partner || blockIdOf(succ) < blockIdOf(partner)) {
+          partner = succ;
+        }
+      }
+      frontier = nextFrontier;
+    }
+
+    if (partner) {
+      info->leadPartners[block] = partner;
+      LDBG("Block " << block << " leads over the block " << partner << "\n");
+    }
+  }
+
+  LDBG("Found " << info->leadPartners.size() << " block lead partners." << "\n");
+  return UPDATE_CONDITION_INFO_SUCCESS;
+}
+
 // Allocate the SSBuffer pointers of the block level counters.
 //   vector block: one counter per vector core, at byteOffset and
 //                 byteOffset + VECTOR_SSBUF_OFFSET
@@ -1183,6 +1270,58 @@ Value UpdateConditionInfoPass::loadCounter(
   return loadOp.getResult();
 }
 
+// The number of the cross-core buffers: the lead condition bounds the
+// difference of the two block counters with it.
+int UpdateConditionInfoPass::getLeadBufferCount(ModuleOp module) {
+  if (auto attr =
+          module->getAttrOfType<IntegerAttr>(CVPipeline::kInterCoreBufCount)) {
+    return attr.getInt();
+  }
+  if (info->crossCoreBufferCount > 0) {
+    return info->crossCoreBufferCount;
+  }
+  return 2;
+}
+
+// Build the lead condition of `ifOp`.
+//
+// The block must not run more than `leadBufferCount` rounds ahead of its lead
+// partner, the closest block of the same core that depends on it:
+//
+//   c_ifOp - c_partner <= leadBufferCount
+//
+// Both counters belong to the same core: the running core sees a single copy
+// of each of them, the copy of its own core for the vector side.
+Value UpdateConditionInfoPass::addLeadCondition(
+    OpBuilder &builder, Location loc, scf::IfOp ifOp, bool isAIC,
+    DenseMap<int, Value> &vectorSSBufferMemrefs,
+    SmallVector<SmallVector<Value>> ssbufferPtrs,
+    DenseMap<Value, Value> &loadedCounters) {
+  auto partnerIt = info->leadPartners.find(ifOp);
+  if (partnerIt == info->leadPartners.end()) {
+    return nullptr;
+  }
+  scf::IfOp partner = partnerIt->second;
+
+  SmallVector<Value> ownMemrefs = getBlockCounterMemrefs(
+      isAIC, ifOp, vectorSSBufferMemrefs, ssbufferPtrs);
+  SmallVector<Value> partnerMemrefs = getBlockCounterMemrefs(
+      isAIC, partner, vectorSSBufferMemrefs, ssbufferPtrs);
+  if (ownMemrefs.empty() || partnerMemrefs.empty()) {
+    LDBG("Missing counter address for the lead condition of " << ifOp << "\n");
+    return nullptr;
+  }
+
+  Value ownValue = loadCounter(builder, loc, ownMemrefs[0], loadedCounters);
+  Value partnerValue =
+      loadCounter(builder, loc, partnerMemrefs[0], loadedCounters);
+  Value diff = builder.create<arith::SubIOp>(loc, ownValue, partnerValue);
+  Value bufferNum = builder.create<arith::ConstantIntOp>(
+      loc, leadBufferCount, CONST_INT_TYPE);
+  return builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle, diff,
+                                       bufferNum);
+}
+
 // Increment the counter owned by `ifOp` at the end of its then block.
 // Every counter has a single writer: the block owning it. A vector block owns
 // one counter per vector core and only bumps the copy of the core it runs on.
@@ -1265,22 +1404,29 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
   DenseMap<int, Value> vectorSSBufferMemrefs;
   if (!isAIC) {
     SmallVector<int> neededSlots;
+    auto addNeededSlot = [&](scf::IfOp block) {
+      auto slotIt = info->blockCounterSlots.find(block);
+      if (slotIt == info->blockCounterSlots.end()) {
+        return;
+      }
+      if (!slotIt->second.isVector) {
+        return;
+      }
+      if (!llvm::is_contained(neededSlots, slotIt->second.slot)) {
+        neededSlots.push_back(slotIt->second.slot);
+      }
+    };
     auto edgesIt = info->crossCoreBlockEdges.find(ifOp);
     if (edgesIt != info->crossCoreBlockEdges.end()) {
       for (const CrossCoreBlockEdge &edge : edgesIt->second) {
-        for (scf::IfOp block : {edge.producer, edge.consumer}) {
-          auto slotIt = info->blockCounterSlots.find(block);
-          if (slotIt == info->blockCounterSlots.end()) {
-            continue;
-          }
-          if (!slotIt->second.isVector) {
-            continue;
-          }
-          if (!llvm::is_contained(neededSlots, slotIt->second.slot)) {
-            neededSlots.push_back(slotIt->second.slot);
-          }
-        }
+        addNeededSlot(edge.producer);
+        addNeededSlot(edge.consumer);
       }
+    }
+    // The lead condition reads the counter of the lead partner too.
+    auto partnerIt = info->leadPartners.find(ifOp);
+    if (partnerIt != info->leadPartners.end()) {
+      addNeededSlot(partnerIt->second);
     }
     auto result = computeVectorSSBufferMemrefs(
         builder, loc, scopeOp.getOperation(), neededSlots);
@@ -1305,6 +1451,20 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
   crossCoreCond = addCrossCoreBlockConditions(builder, loc, ifOp, isAIC,
                                               zeroConst, vectorSSBufferMemrefs,
                                               ssbufferPtrs, loadedCounters);
+
+  // The block must not run too far ahead of its lead partner, the closest
+  // block of the same core that depends on it.
+  Value leadCond =
+      addLeadCondition(builder, loc, ifOp, isAIC, vectorSSBufferMemrefs,
+                       ssbufferPtrs, loadedCounters);
+  if (leadCond) {
+    if (crossCoreCond) {
+      crossCoreCond = builder.create<arith::AndIOp>(loc, crossCoreCond,
+                                                     leadCond);
+    } else {
+      crossCoreCond = leadCond;
+    }
+  }
 
   // ========== Part 3: Update the own counter ==========
   updateBlockCounterVars(builder, loc, ifOp, isAIC, oneConst,
@@ -1720,6 +1880,19 @@ void UpdateConditionInfoPass::updateDAGAfterIfOpReplacement(scf::IfOp oldIfOp,
   for (auto &owner : blockCounterOwners) {
     if (owner == oldIfOp) {
       owner = newIfOp;
+    }
+  }
+
+  // 6. Update the lead partners
+  if (info->leadPartners.count(oldIfOp)) {
+    auto partner = info->leadPartners[oldIfOp];
+    info->leadPartners.erase(oldIfOp);
+    info->leadPartners[newIfOp] = partner;
+  }
+
+  for (auto &entry : info->leadPartners) {
+    if (entry.second == oldIfOp) {
+      entry.second = newIfOp;
     }
   }
 }
@@ -2478,7 +2651,17 @@ void UpdateConditionInfoPass::runOnOperation() {
     return;
   }
 
-  // Step3:Init the ssbufferPtrs
+  // Step3:Find, for every computation block, the closest block of the same
+  // core that depends on it. The lead condition bounds how far a block may
+  // run ahead of it.
+  if (collectLeadPartners(module) != UPDATE_CONDITION_INFO_SUCCESS) {
+    LDBG("collectLeadPartners failed!");
+    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+    return;
+  }
+  leadBufferCount = getLeadBufferCount(module);
+
+  // Step4:Init the ssbufferPtrs
   SmallVector<SmallVector<Value>> ssbufferPtrs = allocSSBuffer(module);
 
   // Step3.1:Bracket the counter initialization with the PIPE_S

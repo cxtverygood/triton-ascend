@@ -8,6 +8,10 @@
 // and only bumps that one. The counter has a single writer, so the update
 // reuses the value that the conditions of the block already loaded
 // (addi/store, no second load).
+// On top of that, a block must not run too far ahead of its lead partner,
+// the closest block of the same core that depends on it:
+// c_block - c_partner <= buffer_number. The counter of the partner is read
+// once per iteration, it is shared with the blocks that need it.
 
 // CHECK-LABEL: func.func @while_update_condition_crosscore
 
@@ -41,11 +45,18 @@
 // CHECK: %[[DIFF_OUT5:.*]] = arith.subi %[[LD_V5]], %[[LD_C6]] : i32
 // CHECK: %[[SLT5:.*]] = arith.cmpi slt, %[[DIFF_OUT5]], %{{.*}} : i32
 // CHECK: %[[CROSS5:.*]] = arith.andi %[[SGT5]], %[[SLT5]]
-// CHECK: %[[AND5:.*]] = arith.andi %[[CROSS5]], %{{.*}}
+// The lead condition: the block must not run more than the number of the
+// cross-core buffers ahead of its lead partner, the closest block of the same
+// core that depends on it. The vector block 6 is the lead partner of the
+// vector block 5.
+// CHECK: %[[DIFF_LEAD5:.*]] = arith.subi %[[LD_V5]], %[[LD_V6]] : i32
+// CHECK: %[[SLE5:.*]] = arith.cmpi sle, %[[DIFF_LEAD5]], %{{.*}} : i32
+// CHECK: %[[AND5:.*]] = arith.andi %[[CROSS5]], %[[SLE5]]
+// CHECK: %[[AND5W:.*]] = arith.andi %[[AND5]], %{{.*}}
 // The flag of the loop gates the block: it only runs when no other block of
 // the iteration has run yet.
 // CHECK: %[[FLAGCMP5:.*]] = arith.cmpi eq, %[[FLAG]], %{{.*}} : i32
-// CHECK: %[[AND5F:.*]] = arith.andi %[[AND5]], %[[FLAGCMP5]]
+// CHECK: %[[AND5F:.*]] = arith.andi %[[AND5W]], %[[FLAGCMP5]]
 // CHECK: scf.if %[[AND5F]]
 // The block bumps only its own counter: the value it already read for the
 // conditions is reused, the counter is not loaded again.
@@ -87,9 +98,14 @@
 // CHECK: %[[DIFF1:.*]] = arith.subi %[[LD_OWN0]], %[[LD_V1]] : i32
 // CHECK: %[[SLT1:.*]] = arith.cmpi slt, %[[DIFF1]], %{{.*}} : i32
 // CHECK: %[[CROSS0:.*]] = arith.andi %[[SLT0]], %[[SLT1]]
-// CHECK: %[[AND0:.*]] = arith.andi %[[CROSS0]], %{{.*}}
+// The lead condition of the cube block 0: the cube block 1 is the closest
+// cube block that depends on it.
+// CHECK: %[[DIFF_LEAD0:.*]] = arith.subi %[[LD_OWN0]], %[[LD_OWN1]] : i32
+// CHECK: %[[SLE0:.*]] = arith.cmpi sle, %[[DIFF_LEAD0]], %{{.*}} : i32
+// CHECK: %[[AND0:.*]] = arith.andi %[[CROSS0]], %[[SLE0]]
+// CHECK: %[[AND0W:.*]] = arith.andi %[[AND0]], %{{.*}}
 // CHECK: %[[FLAGCMP0:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}} : i32
-// CHECK: %[[AND0F:.*]] = arith.andi %[[AND0]], %[[FLAGCMP0]]
+// CHECK: %[[AND0F:.*]] = arith.andi %[[AND0W]], %[[FLAGCMP0]]
 // CHECK: scf.if %[[AND0F]]
 // The cube reuses the value of its own counter that it already read.
 // CHECK: %[[ADD0:.*]] = arith.addi %[[LD_OWN0]], %{{.*}} : i32
